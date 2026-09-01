@@ -135,3 +135,15 @@ let package = Package(
         ),
     ]
 )
+
+// SE-0461. This package was written against callee-inherits-caller-isolation
+// semantics: `runRawCompletion` and the prefill/decode chain beneath it call
+// back synchronously on the caller's task, which is what the progress-callback
+// comments assert. Swift 6.4 diagnoses passing those actor-isolated, non-Sendable
+// callbacks into functions it still treats as `@concurrent`. Opting the whole
+// package in makes the compiler model match the code's actual contract instead
+// of annotating each link in the chain.
+for target in package.targets {
+    target.swiftSettings = (target.swiftSettings ?? [])
+        + [.enableUpcomingFeature("NonisolatedNonsendingByDefault")]
+}
