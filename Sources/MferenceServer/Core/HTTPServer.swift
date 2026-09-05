@@ -14,6 +14,7 @@ public actor MferenceHTTPServer {
     private let backend: any ServerInferenceBackend
     private let coordinator: ServerCoordinator
     private let heartbeatInterval: TimeAmount
+    private let log: ServerLog
     private let childChannels = ChildChannelRegistry()
     private var channel: Channel?
     private var shutdownTask: Task<Void, any Error>?
@@ -23,13 +24,15 @@ public actor MferenceHTTPServer {
                 backend: any ServerInferenceBackend,
                 chatDialect: ChatDialect = .gemma,
                 heartbeatInterval: TimeAmount = .seconds(5),
-                group: MultiThreadedEventLoopGroup = .init(numberOfThreads: 1)) {
+                group: MultiThreadedEventLoopGroup = .init(numberOfThreads: 1),
+                log: any ServerLogSink = StandardErrorServerLogSink()) {
         self.group = group
         self.modelID = modelID
         self.chatDialect = chatDialect
         self.backend = backend
         self.coordinator = ServerCoordinator(queueLimit: queueLimit)
         self.heartbeatInterval = heartbeatInterval
+        self.log = ServerLog(sink: log)
     }
 
     public func start(host: String = "127.0.0.1", port: Int) async throws -> Channel {
@@ -38,6 +41,7 @@ public actor MferenceHTTPServer {
         let backend = self.backend
         let coordinator = self.coordinator
         let heartbeatInterval = self.heartbeatInterval
+        let log = self.log
         let childChannels = self.childChannels
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 16)
@@ -54,7 +58,8 @@ public actor MferenceHTTPServer {
                         backend: backend,
                         coordinator: coordinator,
                         heartbeatInterval: heartbeatInterval,
-                        childChannels: childChannels))
+                        childChannels: childChannels,
+                        log: log))
                 }
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -101,15 +106,15 @@ public actor MferenceHTTPServer {
         try await task.value
     }
 
-    var queuedRequestCount: Int {
+    public var queuedRequestCount: Int {
         get async { await coordinator.queuedCount }
     }
 
-    var hasActiveRequest: Bool {
+    public var hasActiveRequest: Bool {
         get async { await coordinator.isActive }
     }
 
-    var acceptedConnectionCount: Int {
+    public var acceptedConnectionCount: Int {
         childChannels.count
     }
 }
@@ -124,6 +129,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private let coordinator: ServerCoordinator
     private let heartbeatInterval: TimeAmount
     private let childChannels: ChildChannelRegistry
+    private let log: ServerLog
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
     private var oversized = false
@@ -134,13 +140,15 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
          backend: any ServerInferenceBackend,
          coordinator: ServerCoordinator,
          heartbeatInterval: TimeAmount,
-         childChannels: ChildChannelRegistry) {
+         childChannels: ChildChannelRegistry,
+         log: ServerLog) {
         self.modelID = modelID
         self.chatDialect = chatDialect
         self.backend = backend
         self.coordinator = coordinator
         self.heartbeatInterval = heartbeatInterval
         self.childChannels = childChannels
+        self.log = log
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -158,13 +166,16 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
         case .end:
             guard let head else { return }
             self.head = nil
+            // Clients may append a query component to any route; match on the path.
+            let path = String(head.uri.prefix { $0 != "?" })
             if oversized {
-                writeError(context, status: .payloadTooLarge,
-                           OpenAIErrorEnvelope(message: "request body is too large",
-                                               code: "request_too_large"))
+                reject(context, method: head.method.rawValue, path: path,
+                       status: .payloadTooLarge,
+                       OpenAIErrorEnvelope(message: "request body is too large",
+                                           code: "request_too_large"))
                 return
             }
-            route(head: head, body: body, context: context)
+            route(head: head, path: path, body: body, context: context)
         }
     }
 
@@ -176,12 +187,13 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     }
 
     private func route(head: HTTPRequestHead,
+                       path: String,
                        body: ByteBuffer,
                        context: ChannelHandlerContext) {
-        // Clients may append a query component to any route; match on the path.
-        let path = String(head.uri.prefix { $0 != "?" })
+        let method = head.method.rawValue
         switch (head.method, path) {
         case (.GET, "/health"):
+            log.routed(method: method, path: path, status: HTTPResponseStatus.ok.code)
             writeJSON(context, status: .ok, object: ["status": "ok"])
         case (.GET, "/v1/models"):
             let response = OpenAIModelList(
@@ -190,32 +202,63 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                              object: "model",
                              created: 0,
                              ownedBy: "mference")])
+            log.routed(method: method, path: path, status: HTTPResponseStatus.ok.code)
             writeCodable(context, status: .ok, response)
         case (.POST, "/v1/chat/completions"):
             guard head.headers.first(name: "content-type")?
                 .lowercased().hasPrefix("application/json") == true else {
-                writeError(context, status: .unsupportedMediaType,
-                           OpenAIErrorEnvelope(message: "content-type must be application/json",
-                                               code: "unsupported_media_type"))
+                reject(context, method: method, path: path,
+                       status: .unsupportedMediaType,
+                       OpenAIErrorEnvelope(message: "content-type must be application/json",
+                                           code: "unsupported_media_type"))
                 return
             }
-            handleCompletion(body: body, context: context)
+            handleCompletion(method: method, path: path, body: body, context: context)
         case (_, "/health"), (_, "/v1/models"), (_, "/v1/chat/completions"):
-            writeError(context, status: .methodNotAllowed,
-                       OpenAIErrorEnvelope(message: "method not allowed",
-                                           code: "method_not_allowed"))
+            reject(context, method: method, path: path,
+                   status: .methodNotAllowed,
+                   OpenAIErrorEnvelope(message: "method not allowed",
+                                       code: "method_not_allowed"))
         default:
-            writeError(context, status: .notFound,
-                       OpenAIErrorEnvelope(message: "route not found",
-                                           code: "not_found"))
+            reject(context, method: method, path: path,
+                   status: .notFound,
+                   OpenAIErrorEnvelope(message: "route not found",
+                                       code: "not_found"))
         }
     }
 
-    private func handleCompletion(body: ByteBuffer,
+    /// Logs and answers a rejection decided on the event loop, before the
+    /// request has an id or has reached the backend.
+    private func reject(_ context: ChannelHandlerContext,
+                        method: String,
+                        path: String,
+                        requestedModel: String? = nil,
+                        status: HTTPResponseStatus,
+                        _ envelope: OpenAIErrorEnvelope) {
+        log.requestRejected(method: method, path: path, requestedModel: requestedModel,
+                            status: status.code, envelope: envelope)
+        writeError(context, status: status, envelope)
+    }
+
+    private func handleCompletion(method: String,
+                                  path: String,
+                                  body: ByteBuffer,
                                   context: ChannelHandlerContext) {
+        let malformed = OpenAIErrorEnvelope(message: "malformed JSON request",
+                                            code: "invalid_json")
+        let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) ?? []
+        let decoded: OpenAIChatRequest
         do {
-            let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) ?? []
-            let decoded = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(bytes))
+            decoded = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(bytes))
+        } catch {
+            reject(context, method: method, path: path, status: .badRequest, malformed)
+            return
+        }
+        // Held apart from validation so an `unknownModel` rejection can name
+        // what the client actually sent: model matching is strict equality,
+        // and a misspelt id is the most common integration mistake.
+        let requestedModel = decoded.model
+        do {
             let request = try OpenAIRequestValidator.validate(decoded, modelID: modelID,
                                                               dialect: chatDialect)
             let responseID = "chatcmpl-" + UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
@@ -239,7 +282,11 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             activeTask = childChannels.startTask {
                 defer { streamState.stop() }
                 let started = ContinuousClock.now
-                ServerLog.requestStarted(id: responseID, streaming: request.stream)
+                self.log.requestStarted(id: responseID,
+                                        method: method,
+                                        path: path,
+                                        requestedModel: requestedModel,
+                                        streaming: request.stream)
                 do {
                     // Rendering and the context check happen before the head
                     // is written, so a rejected prompt still gets a status
@@ -269,9 +316,12 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                             }
                         }
                     }
-                    ServerLog.requestCompleted(id: responseID,
-                                               duration: started.duration(to: .now),
-                                               completion: completion)
+                    self.log.requestCompleted(id: responseID,
+                                              method: method,
+                                              path: path,
+                                              requestedModel: requestedModel,
+                                              duration: started.duration(to: .now),
+                                              completion: completion)
                     if request.stream {
                         self.finishStream(contextBox.value,
                                           id: responseID,
@@ -288,17 +338,21 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                     self.handleAsyncError(error,
                                           context: contextBox.value,
                                           id: responseID,
+                                          method: method,
+                                          path: path,
+                                          requestedModel: requestedModel,
                                           stream: streamState.isStarted)
                 }
             }
         } catch let error as ServerRequestError {
-            writeError(context,
-                       status: error == .unknownModel ? .notFound : .badRequest,
-                       error.envelope)
+            reject(context, method: method, path: path, requestedModel: requestedModel,
+                   status: error == .unknownModel ? .notFound : .badRequest,
+                   error.envelope)
         } catch {
-            writeError(context, status: .badRequest,
-                       OpenAIErrorEnvelope(message: "malformed JSON request",
-                                           code: "invalid_json"))
+            // Historical tool-call arguments are parsed during validation and
+            // can fail to decode after the envelope itself did.
+            reject(context, method: method, path: path, requestedModel: requestedModel,
+                   status: .badRequest, malformed)
         }
     }
 
@@ -439,11 +493,16 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private func handleAsyncError(_ error: Error,
                                   context: ChannelHandlerContext,
                                   id: String,
+                                  method: String,
+                                  path: String,
+                                  requestedModel: String?,
                                   stream: Bool) {
         let (envelope, status) = failure(for: error)
-        ServerLog.requestFailed(id: id, status: status.code, streaming: stream, error: error)
+        log.requestFailed(id: id, method: method, path: path, requestedModel: requestedModel,
+                          status: status.code, streaming: stream, error: error)
         if stream {
-            failStream(context, id: id, envelope: envelope)
+            failStream(context, id: id, method: method, path: path,
+                       requestedModel: requestedModel, envelope: envelope)
         } else {
             writeError(context, status: status, envelope)
         }
@@ -453,8 +512,12 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     /// stream reports the same envelope in-band and keeps its committed `200`.
     private func failure(for error: Error) -> (OpenAIErrorEnvelope, HTTPResponseStatus) {
         if let requestError = error as? ServerRequestError {
-            return (requestError.envelope,
-                    requestError == .queueFull ? .tooManyRequests : .badRequest)
+            let status: HTTPResponseStatus = switch requestError {
+            case .queueFull: .tooManyRequests
+            case .unavailable: .serviceUnavailable
+            case .invalid, .unknownModel: .badRequest
+            }
+            return (requestError.envelope, status)
         }
         return (OpenAIErrorEnvelope(message: "generation failed",
                                     type: "server_error",
@@ -467,10 +530,15 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     /// client as an opaque transport error with no reason attached.
     private func failStream(_ context: ChannelHandlerContext,
                             id: String,
+                            method: String,
+                            path: String,
+                            requestedModel: String?,
                             envelope: OpenAIErrorEnvelope) {
         let contextBox = SendableContext(context)
         guard let data = try? JSONEncoder().encode(envelope) else {
-            ServerLog.streamAborted(id: id, reason: "error envelope could not be encoded")
+            log.streamAborted(id: id, method: method, path: path,
+                              requestedModel: requestedModel,
+                              reason: "error envelope could not be encoded")
             context.eventLoop.execute { contextBox.value.close(promise: nil) }
             return
         }
