@@ -2642,16 +2642,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 }
                 wait(pending.cb)
             } else if let err = pending.cb.error {
-                print("CB error: \(err)")
+                runtimeDiagnostic("CB error: \(err)")
             }
             if let attentionCB = pending.attentionCB {
                 if let err = attentionCB.error {
-                    print("CB error: \(err)")
+                    runtimeDiagnostic("CB error: \(err)")
                 }
             }
             if let phase1HitCB = pending.phase1HitCB,
                let err = phase1HitCB.error {
-                print("CB error: \(err)")
+                runtimeDiagnostic("CB error: \(err)")
             }
             totalCb2Nanos &+= pending.encodeAndCommitNanos
         }
@@ -3370,7 +3370,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
         }
         let mean = sum / Double(max(count - bad, 1))
-        print("[inkling] \(label) n=\(count) "
+        runtimeDiagnostic("[inkling] \(label) n=\(count) "
               + String(format: "min=%.4f max=%.4f mean=%.5f", mn, mx, mean)
               + " nonfinite=\(bad)")
     }
@@ -3495,9 +3495,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 if let hitCB = p.phase1HitCB { waitForCompletion(hitCB) }
                 waitForCompletion(p.cb)
             } else {
-                if let err = p.cb.error { print("CB error: \(err)") }
-                if let err = p.attentionCB.error { print("CB error: \(err)") }
-                if let err = p.phase1HitCB?.error { print("CB error: \(err)") }
+                if let err = p.cb.error { runtimeDiagnostic("CB error: \(err)") }
+                if let err = p.attentionCB.error { runtimeDiagnostic("CB error: \(err)") }
+                if let err = p.phase1HitCB?.error { runtimeDiagnostic("CB error: \(err)") }
             }
         }
         func writeActiveSlots(_ slots: [UInt32], into buffer: MTLBuffer) {
@@ -3966,7 +3966,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     .bindMemory(to: Float16.self, capacity: 8)
                 let idx = outIndices.contents()
                     .bindMemory(to: UInt32.self, capacity: 6)
-                print("[inkling] L\(L) gammas=(\(g[0]), \(g[1])) " +
+                runtimeDiagnostic("[inkling] L\(L) gammas=(\(g[0]), \(g[1])) " +
                       "w=\((0..<8).map { Float(w[$0]) }) " +
                       "idx=\((0..<6).map { idx[$0] })")
             }
@@ -4066,7 +4066,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             top[7] = (i, v); top.sort { $0.1 > $1.1 }
                         }
                     }
-                    print("[inkling] head top8 = \(top)")
+                    runtimeDiagnostic("[inkling] head top8 = \(top)")
                 }
             }
         }
@@ -4866,7 +4866,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 if let hitCB = pending.phase1HitCB { waitForCompletion(hitCB) }
                 waitForCompletion(pending.cb)
             } else if let err = pending.cb.error {
-                print("CB error: \(err)")
+                runtimeDiagnostic("CB error: \(err)")
             }
             totalCb2Nanos &+= pending.encodeAndCommitNanos
         }
@@ -5537,14 +5537,14 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         cb.commit()
         cb.waitUntilCompleted()
         if let err = cb.error {
-            print("CB error: \(err)")
+            runtimeDiagnostic("CB error: \(err)")
         }
     }
 
     private nonisolated func waitForCompletion(_ cb: MTLCommandBuffer) {
         cb.waitUntilCompleted()
         if let err = cb.error {
-            print("CB error: \(err)")
+            runtimeDiagnostic("CB error: \(err)")
         }
     }
 
