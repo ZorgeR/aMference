@@ -230,6 +230,10 @@ public enum ServerRequestError: Error, Equatable, Sendable {
     case invalid(message: String, param: String?, code: String)
     case unknownModel
     case queueFull
+    /// The backend cannot serve any request right now, for example an
+    /// embedding host with no model loaded. Answered with `503`, so the
+    /// condition is never mistaken for a fault in the request.
+    case unavailable(String)
 
     public var envelope: OpenAIErrorEnvelope {
         switch self {
@@ -241,6 +245,10 @@ public enum ServerRequestError: Error, Equatable, Sendable {
         case .queueFull:
             OpenAIErrorEnvelope(message: "generation queue is full",
                                 code: "queue_full")
+        case .unavailable(let message):
+            OpenAIErrorEnvelope(message: message,
+                                type: "server_error",
+                                code: "service_unavailable")
         }
     }
 }

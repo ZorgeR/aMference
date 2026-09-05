@@ -29,13 +29,19 @@ public struct PreparedGeneration: Sendable {
     public let request: ValidatedChatRequest
     public let promptIDs: [Int32]
     public let needsToolTemplate: Bool
+    /// Backend-private state carried from `prepare` into `generate`, so a
+    /// backend that translates the request can do all of its rejecting in
+    /// `prepare` and never re-derive anything once the status is committed.
+    public let payload: (any Sendable)?
 
     public init(request: ValidatedChatRequest,
                 promptIDs: [Int32] = [],
-                needsToolTemplate: Bool = false) {
+                needsToolTemplate: Bool = false,
+                payload: (any Sendable)? = nil) {
         self.request = request
         self.promptIDs = promptIDs
         self.needsToolTemplate = needsToolTemplate
+        self.payload = payload
     }
 }
 
