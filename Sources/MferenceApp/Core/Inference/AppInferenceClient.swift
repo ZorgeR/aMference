@@ -37,8 +37,9 @@ public protocol AppInferenceDeltaStreaming: AppInferenceClient {
 }
 
 /// A client whose transport can be torn down out of band when it stops
-/// responding. `AppInferenceArbiter`'s watchdog calls it after `cancel()`
-/// when a generation has produced no event for the watchdog duration.
+/// responding. `AppInferenceArbiter`'s watchdog calls it, off the actor,
+/// after `cancel()` when a generation that has already produced an event
+/// then stays silent for the watchdog duration.
 public protocol AppInferenceTransportControlling: AnyObject, AppInferenceClient {
     func shutdown()
 }

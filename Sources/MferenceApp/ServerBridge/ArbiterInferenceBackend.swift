@@ -47,6 +47,10 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
     /// Requests inside `generate`: waiting for the lease or decoding.
     private var live: Set<UUID> = []
     private var activeRequest: UUID?
+    /// Set by `beginStopping()`; `generate` then refuses every request at
+    /// once. `APIServerModel` builds a fresh backend per start, so a new
+    /// listener never inherits it.
+    private var stopping = false
 
     public init(arbiter: AppInferenceArbiter,
                 log: APIServerLogSink,
@@ -68,6 +72,9 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
     /// True while a request holds the decode session.
     public var hasActiveRequest: Bool { activeRequest != nil }
 
+    /// True after `beginStopping()`.
+    public var isStopping: Bool { stopping }
+
     // MARK: ServerInferenceBackend
 
     public func prepare(_ request: ValidatedChatRequest) async throws -> PreparedGeneration {
@@ -75,11 +82,11 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
             log.record(APIServerBridgeNote(kind: .modelNotLoaded))
             throw ServerRequestError.unavailable("no model is loaded")
         }
+        // Substitutions are carried in the plan and logged when `generate`
+        // starts: a request the context guard below rejects with 400 must not
+        // leave "pinned" rows that suggest a rewritten request was served.
         let (translated, substitutions) = try ArbiterRequestTranslation.translate(
             request, session: session, policy: policy)
-        for substitution in substitutions {
-            log.record(APIServerBridgeNote(kind: .substitution(substitution)))
-        }
         let measured: APIServerPromptMeasurement
         do {
             measured = try await measurePrompt(translated)
@@ -110,6 +117,14 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
         guard let plan = prepared.payload as? Plan else {
             throw ServerRequestError.unavailable("the request was not prepared by the in-app server")
         }
+        // A request released from the coordinator's queue after the stop
+        // drain must not start a fresh generation the shutdown then waits on.
+        guard !stopping else {
+            throw ServerRequestError.unavailable("the server is stopping")
+        }
+        for substitution in plan.substitutions {
+            log.record(APIServerBridgeNote(kind: .substitution(substitution)))
+        }
         let id = UUID()
         let owner = AppInferenceOwner.http(id)
         live.insert(id)
@@ -139,6 +154,13 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
     }
 
     // MARK: Control
+
+    /// First step of a stop: from here on `generate` answers 503 without
+    /// touching the arbiter, so nothing queued behind the drained requests
+    /// can start a generation.
+    public func beginStopping() {
+        stopping = true
+    }
 
     /// Cancels the request that holds the decode session, if any. Lease
     /// scoped: a chat generation is never touched.
@@ -202,6 +224,12 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
         } catch {
             if terminal == nil { throw Self.map(error) }
         }
+        // A client that closed its socket cancels the request task, and the
+        // iterator then ends without a terminal event. Name that cause; the
+        // decode session did nothing wrong.
+        if terminal == nil, Task.isCancelled {
+            throw Self.clientDisconnected
+        }
 
         let tail = filter.finish()
         if !tail.isEmpty { onEvent(.content(tail)) }
@@ -259,6 +287,7 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
             switch error {
             case .busyTimeout: return ServerRequestError.queueFull
             case .unavailable(let reason): return ServerRequestError.unavailable(reason)
+            case .transportLost: return ServerRequestError.unavailable(error.description)
             case .cancelled: return cancelledError()
             }
         case let error as AppInferenceError:
@@ -283,9 +312,18 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
         }
     }
 
+    /// The request task is cancelled only when its client went away
+    /// (`channelInactive`) or the listener is closing after the stop drain.
+    /// Either way the wire cancel that follows is a consequence, not the
+    /// cause, so the row must not read as a decode-session failure — and the
+    /// same disconnect must produce the same row whether the iterator noticed
+    /// the cancellation before or after the service's `.cancelled` event.
+    static let clientDisconnected =
+        ServerRequestError.unavailable("the client disconnected before the answer completed")
+
     private static func cancelledError() -> any Error {
         Task.isCancelled
-            ? CancellationError()
+            ? clientDisconnected
             : ServerRequestError.unavailable("the request was cancelled before it completed")
     }
 

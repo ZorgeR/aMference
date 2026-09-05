@@ -60,17 +60,26 @@ public struct AppInferenceActivity: Equatable, Sendable {
 public enum AppInferenceArbiterError: Error, Equatable, Sendable, CustomStringConvertible {
     /// `acquire` waited for its whole timeout behind another owner.
     case busyTimeout
-    /// Admission is closed (a load or unload is running, or the transport
-    /// was torn down); the string is the reason, suitable for display.
+    /// Admission is closed (a load or unload is running); the string is the
+    /// reason, suitable for display.
     case unavailable(String)
     /// The waiting owner was cancelled before it was admitted.
     case cancelled
+    /// The watchdog shut the transport down under the active generation.
+    /// The loaded session is gone with it: the arbiter publishes
+    /// `loadedSession == nil`, and the owner of the model must reload.
+    case transportLost
+
+    /// What the chat UI and the load state show after the watchdog fires.
+    public static let transportLostMessage =
+        "The decode service stopped responding and was shut down; reload the model."
 
     public var description: String {
         switch self {
         case .busyTimeout: return "The decode session stayed busy for too long."
         case .unavailable(let reason): return reason
         case .cancelled: return "Generation cancelled."
+        case .transportLost: return Self.transportLostMessage
         }
     }
 
@@ -78,7 +87,7 @@ public enum AppInferenceArbiterError: Error, Equatable, Sendable, CustomStringCo
     public var inferenceError: AppInferenceError {
         switch self {
         case .cancelled: return .cancelled
-        case .busyTimeout, .unavailable: return .unknown(description)
+        case .busyTimeout, .unavailable, .transportLost: return .unknown(description)
         }
     }
 }
@@ -95,9 +104,13 @@ public enum AppInferenceArbiterError: Error, Equatable, Sendable, CustomStringCo
 /// through `withExclusiveSession`, which drains the active generation to its
 /// terminal event before the lifecycle call runs on the same handle.
 ///
-/// A watchdog fails any active generation that produces no event for
-/// `watchdog`: `DecodeFrameCodec.read` blocks with no deadline and Swift
-/// cancellation cannot interrupt it, so the transport is shut down instead.
+/// An optional watchdog fails the active generation when it goes silent for
+/// `watchdog` *after its first event*: `DecodeFrameCodec.read` blocks with no
+/// deadline and Swift cancellation cannot interrupt it, so the transport is
+/// shut down instead and the lease fails with `.transportLost`. The clock
+/// never starts at registration: the service sends one progress frame per
+/// prefill chunk, and the first one can follow minutes of first-touch expert
+/// hashing on a large install.
 public actor AppInferenceArbiter {
     private enum LeaseSource {
         case held(AppInferenceLeaseTicket)
@@ -105,7 +118,8 @@ public actor AppInferenceArbiter {
     }
 
     private let client: any AppInferenceClient
-    private let watchdogDuration: Duration
+    /// `nil` disables the watchdog.
+    private let watchdogDuration: Duration?
     private let broadcaster: AppInferenceActivityBroadcaster
     private var active: AppInferenceActiveLease?
     private var waiters = AppInferenceWaiterQueue()
@@ -115,7 +129,15 @@ public actor AppInferenceArbiter {
     private var exclusiveWaiters: [CheckedContinuation<Void, Never>] = []
     private var loadedSessionValue: AppLoadedSession?
 
-    public init(client: any AppInferenceClient, watchdog: Duration = .seconds(180)) {
+    /// Exactly one arbiter may exist per client: two arbiters over one
+    /// `DecodeServiceInferenceClient` are two readers on the same pipe. The
+    /// composition root creates the arbiter once and hands the same instance
+    /// to every consumer (`AppModel`, `APIServerModel`).
+    ///
+    /// - Parameter watchdog: silence budget between events of one
+    ///   generation, measured from its first event; `nil` (the default)
+    ///   disables the watchdog.
+    public init(client: any AppInferenceClient, watchdog: Duration? = nil) {
         self.client = client
         self.watchdogDuration = watchdog
         self.broadcaster = AppInferenceActivityBroadcaster(initial: .idle)
@@ -184,8 +206,8 @@ public actor AppInferenceArbiter {
     /// uses it; otherwise a lease is acquired first (with no timeout) and
     /// released when the stream terminates. The stream fails with an
     /// `AppInferenceArbiterError` for arbiter-side outcomes (dequeued by
-    /// `cancel`, admission closed, watchdog) and with whatever the client
-    /// threw otherwise. `onTextDelta` receives every text fragment
+    /// `cancel`, admission closed, `.transportLost` from the watchdog) and
+    /// with whatever the client threw otherwise. `onTextDelta` receives every text fragment
     /// un-throttled when the client supports `AppInferenceDeltaStreaming`.
     public func stream(_ request: AppGenerationRequest,
                        owner: AppInferenceOwner,
@@ -369,8 +391,7 @@ public actor AppInferenceArbiter {
             return
         }
 
-        let record = AppInferenceGenerationRecord(
-            id: generationID, continuation: continuation, lastEvent: .now)
+        let record = AppInferenceGenerationRecord(id: generationID, continuation: continuation)
         active?.pendingGenerationID = nil
         active?.generation = record
         if lease.cancelRequested {
@@ -378,9 +399,6 @@ public actor AppInferenceArbiter {
             finishGeneration(generationID, ticket: ticket,
                              outcome: .failure(AppInferenceArbiterError.cancelled))
             return
-        }
-        active?.generation?.watchdog = Task { [weak self] in
-            await self?.runWatchdog(generationID: generationID, ticket: ticket)
         }
 
         let events = makeClientStream(request, onTextDelta: onTextDelta)
@@ -390,11 +408,22 @@ public actor AppInferenceArbiter {
                 // drains whatever the client still delivers.
                 guard active?.generation?.id == generationID else { continue }
                 active?.generation?.lastEvent = .now
+                startWatchdogIfNeeded(generationID: generationID, ticket: ticket)
                 continuation.yield(event)
             }
             finishGeneration(generationID, ticket: ticket, outcome: .success(()))
         } catch {
             finishGeneration(generationID, ticket: ticket, outcome: .failure(error))
+        }
+    }
+
+    /// The idle clock starts with the first event of a generation, never at
+    /// registration (see the type comment).
+    private func startWatchdogIfNeeded(generationID: UUID, ticket: AppInferenceLeaseTicket) {
+        guard watchdogDuration != nil, active?.generation?.id == generationID,
+              active?.generation?.watchdog == nil else { return }
+        active?.generation?.watchdog = Task { [weak self] in
+            await self?.runWatchdog(generationID: generationID, ticket: ticket)
         }
     }
 
@@ -454,10 +483,12 @@ public actor AppInferenceArbiter {
     // MARK: Watchdog
 
     private func runWatchdog(generationID: UUID, ticket: AppInferenceLeaseTicket) async {
+        guard let watchdogDuration else { return }
         while true {
             guard let lease = active, lease.ticket == ticket,
-                  let record = lease.generation, record.id == generationID else { return }
-            let idle = ContinuousClock.now - record.lastEvent
+                  let record = lease.generation, record.id == generationID,
+                  let lastEvent = record.lastEvent else { return }
+            let idle = ContinuousClock.now - lastEvent
             if idle >= watchdogDuration {
                 fireWatchdog(generationID: generationID, ticket: ticket)
                 return
@@ -470,22 +501,23 @@ public actor AppInferenceArbiter {
         }
     }
 
+    /// Cancel on the wire, fail the lease with `.transportLost`, drop the
+    /// published session, then tear the transport down off the actor:
+    /// `DecodeServiceInferenceClient.shutdown()` polls the child for up to
+    /// ~750 ms and must never stall admission, cancel, or activity
+    /// publication while it does.
     private func fireWatchdog(generationID: UUID, ticket: AppInferenceLeaseTicket) {
         guard let lease = active, lease.ticket == ticket,
               lease.generation?.id == generationID else { return }
         client.cancel()
-        (client as? any AppInferenceTransportControlling)?.shutdown()
         forwardingTasks[generationID]?.cancel()
-        finishGeneration(generationID, ticket: ticket, outcome: .failure(
-            AppInferenceArbiterError.unavailable(
-                "The decode service produced no event for \(Self.seconds(watchdogDuration)) s and was shut down.")))
-    }
-
-    private static func seconds(_ duration: Duration) -> Int {
-        let components = duration.components
-        let seconds = Double(components.seconds)
-            + Double(components.attoseconds) / 1_000_000_000_000_000_000
-        return Int(seconds.rounded())
+        finishGeneration(generationID, ticket: ticket,
+                         outcome: .failure(AppInferenceArbiterError.transportLost))
+        loadedSessionValue = nil
+        publishActivity()
+        if let transport = client as? any AppInferenceTransportControlling {
+            Task.detached { transport.shutdown() }
+        }
     }
 
     // MARK: Activity

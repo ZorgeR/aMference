@@ -74,8 +74,9 @@ struct BridgeHarness {
                       policy: APIServerSamplingPolicy = .rejectOnMismatch,
                       busyTimeout: Duration = .seconds(5),
                       queueLimit: Int = 4,
+                      watchdog: Duration? = nil,
                       environment: APIServerEnvironment = BridgeFixtures.environment()) async throws -> BridgeHarness {
-        let arbiter = AppInferenceArbiter(client: client)
+        let arbiter = AppInferenceArbiter(client: client, watchdog: watchdog)
         if let session { await arbiter.publishLoadedSession(session) }
         let model = APIServerModel(arbiter: arbiter, environment: environment,
                                    logFlushDelay: .milliseconds(10))

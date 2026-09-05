@@ -60,7 +60,9 @@ public final class AppModel {
     private let client: any AppInferenceClient
     /// Sole caller of `client`. Every generation, load, and unload goes
     /// through it so nothing else can read the decode pipe concurrently.
-    private let arbiter: AppInferenceArbiter
+    /// Exposed so the composition root can hand this same instance to the
+    /// in-app API server; see `init`.
+    public let arbiter: AppInferenceArbiter
     /// Ends on its own: the arbiter finishes every activity stream when it
     /// deallocates, which follows this model's own deallocation.
     @ObservationIgnored private var activityTask: Task<Void, Never>?
@@ -85,6 +87,12 @@ public final class AppModel {
     private let installETAOrigin: SuspendingClock.Instant
     private var installETAEstimator = DownloadETAEstimator()
 
+    /// Exactly one `AppInferenceArbiter` may exist per
+    /// `DecodeServiceInferenceClient`: the decode pipe tolerates one reader,
+    /// and two arbiters over one client would both call `generate`. When
+    /// `arbiter` is nil the model creates one over `client` and publishes it
+    /// as `arbiter`; the composition root must pass that same instance to
+    /// `APIServerModel` (and any other consumer) rather than building another.
     public init(modelDirectory: URL? = nil,
                 client: any AppInferenceClient = RealInferenceClient(),
                 arbiter: AppInferenceArbiter? = nil,
@@ -523,18 +531,26 @@ public final class AppModel {
 
     /// Unloads behind the arbiter's barrier: any active generation is
     /// cancelled and drained to its terminal event first, so `unload` never
-    /// reads the decode pipe while a generation is still using it. Unload
-    /// tasks are never cancelled, so the barrier is the only thing that can
-    /// throw here.
+    /// reads the decode pipe while a generation is still using it. The
+    /// session is cleared inside the barrier, mirroring `beginLoad`, so
+    /// admission never reopens over a stale session: an HTTP `prepare` that
+    /// lands right after the unload sees no session, never the old one.
+    /// Unload tasks are never cancelled, so the barrier is the only thing
+    /// that can throw here; if it does, the body never ran and the session
+    /// is cleared afterwards to match the app's unloaded state.
     private nonisolated static func unloadExclusively(
         _ lifecycle: any AppModelLifecycleClient,
         via arbiter: AppInferenceArbiter,
         reason: String
     ) async {
-        try? await arbiter.withExclusiveSession(reason: reason) {
-            await lifecycle.unload()
+        do {
+            try await arbiter.withExclusiveSession(reason: reason) {
+                await lifecycle.unload()
+                await arbiter.publishLoadedSession(nil)
+            }
+        } catch {
+            await arbiter.publishLoadedSession(nil)
         }
-        await arbiter.publishLoadedSession(nil)
     }
 
     public func installModel() {
@@ -1135,6 +1151,9 @@ public final class AppModel {
             } catch let appError as AppInferenceError {
                 await self.finishStreamFailure(appError)
             } catch let arbiterError as AppInferenceArbiterError {
+                if case .transportLost = arbiterError {
+                    await self.handleTransportLost()
+                }
                 await self.finishStreamFailure(arbiterError.inferenceError)
             } catch {
                 await self.finishStreamFailure(.unknown("\(error)"))
@@ -1593,7 +1612,17 @@ public final class AppModel {
     }
 
     private func applyInferenceActivity(_ activity: AppInferenceActivity) {
+        let previous = inferenceActivity
         inferenceActivity = activity
+        // The arbiter drops the published session when its watchdog shut the
+        // transport down under an API request (a chat generation reports
+        // `.transportLost` itself). Every other path that clears the session
+        // (unload, cancelled load, model switch, failed load) has already
+        // moved `loadState` off `.ready` or has its task in flight.
+        if previous.loadedSession != nil, activity.loadedSession == nil,
+           loadState.isReady, loadTask == nil, unloadTask == nil {
+            handleTransportLost()
+        }
         // Only a committed chat generation shows the queued phase; while the
         // request is still being prepared the phase already says so.
         guard isRunning, activeRunChatID != nil else { return }
@@ -1602,6 +1631,17 @@ public final class AppModel {
         } else if phase == .queued {
             phase = .prefill
         }
+    }
+
+    /// The decode service was shut down by the arbiter's watchdog: the
+    /// process and its loaded weights are gone, so the app must not keep
+    /// claiming a ready model. `.failed` reopens `canLoadModel`, so the UI
+    /// offers Load again with the reason attached.
+    private func handleTransportLost() {
+        guard loadState.isReady else { return }
+        loadedRuntimeKey = nil
+        liveMemoryBytes = nil
+        loadState = .failed(.modelLoadFailed(AppInferenceArbiterError.transportLostMessage))
     }
 
     func apply(_ event: AppInferenceEvent) {

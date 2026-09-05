@@ -176,7 +176,9 @@ struct AppInferenceGenerationRecord {
     let id: UUID
     let continuation: AsyncThrowingStream<AppInferenceEvent, Error>.Continuation
     let completion = AppInferenceCompletion()
-    var lastEvent: ContinuousClock.Instant
+    /// `nil` until the first event; the watchdog's clock starts there.
+    var lastEvent: ContinuousClock.Instant?
+    /// Started with the first event when the arbiter has a watchdog.
     var watchdog: Task<Void, Never>?
 }
 

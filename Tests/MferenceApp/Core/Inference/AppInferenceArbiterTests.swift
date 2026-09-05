@@ -285,28 +285,90 @@ import Testing
 
     // MARK: Watchdog
 
-    @Test func watchdogTearsDownAStalledGeneration() async throws {
+    private static let session = AppLoadedSession(
+        modelDirectory: URL(fileURLWithPath: "/tmp/arbiter.gturbo"),
+        maxContextTokens: 4_096, runtimeOptions: AppRuntimeOptions(),
+        forceLogitsHead: true, temperature: 0.2, topK: 64, topP: 0.95)
+
+    @Test func watchdogIsOffByDefault() async throws {
         let client = ScriptedInferenceClient()
-        client.cancelEmitsTerminal = false
-        let arbiter = AppInferenceArbiter(client: client, watchdog: .milliseconds(40))
+        let arbiter = AppInferenceArbiter(client: client)
         let chatEvents = Task {
             try await collect(await arbiter.stream(Self.request, owner: .chat))
         }
+        try await waitUntil { client.generateCount == 1 }
+        client.emitToken("first")
+        try await Task.sleep(for: .milliseconds(120))
+        #expect(client.cancelCount == 0)
+        #expect(client.shutdownCount == 0)
+        client.finishCurrent()
+        let events = try await chatEvents.value
+        guard case .finished = events.last else {
+            Issue.record("expected a finished terminal event, received \(events)")
+            return
+        }
+    }
 
+    @Test func watchdogClockDoesNotStartBeforeTheFirstEvent() async throws {
+        let client = ScriptedInferenceClient()
+        client.cancelEmitsTerminal = false
+        let arbiter = AppInferenceArbiter(client: client, watchdog: .milliseconds(40))
+        await arbiter.publishLoadedSession(Self.session)
+        let chatEvents = Task {
+            try await collect(await arbiter.stream(Self.request, owner: .chat))
+        }
+        try await waitUntil { client.generateCount == 1 }
+
+        // Several budgets of silence before any event: the service is still
+        // inside its first prefill chunk (first-touch hashing included).
+        try await Task.sleep(for: .milliseconds(160))
+        #expect(client.cancelCount == 0)
+        #expect(client.shutdownCount == 0)
+        #expect(await arbiter.activity.activeOwner == .chat)
+        #expect(await arbiter.loadedSession == Self.session)
+
+        // The first event starts the clock; the same silence now fires it.
+        client.emitToken("first")
         var failure: AppInferenceArbiterError?
         do {
             _ = try await chatEvents.value
         } catch let error as AppInferenceArbiterError {
             failure = error
         }
-        guard case .unavailable(let reason) = failure else {
-            Issue.record("expected the watchdog to fail the lease, received \(String(describing: failure))")
-            return
-        }
-        #expect(reason.contains("no event"))
-        #expect(client.cancelCount >= 1)
-        #expect(client.shutdownCount == 1)
+        #expect(failure == .transportLost)
+        #expect(client.cancelCount == 1)
+        try await waitUntil { client.shutdownCount == 1 }
+        #expect(await arbiter.loadedSession == nil)
         try await waitUntil { await arbiter.activity == .idle }
+    }
+
+    @Test func watchdogFailsTheLeaseWithTransportLostAndPublishesNoSession() async throws {
+        let client = ScriptedInferenceClient()
+        client.cancelEmitsTerminal = false
+        let arbiter = AppInferenceArbiter(client: client, watchdog: .milliseconds(40))
+        await arbiter.publishLoadedSession(Self.session)
+        let recorder = ActivityRecorder(arbiter.activityStream)
+        try await waitUntil { recorder.count == 1 }
+        let httpID = UUID()
+        let httpEvents = Task {
+            try await collect(await arbiter.stream(Self.request, owner: .http(httpID)))
+        }
+        try await waitUntil { client.generateCount == 1 }
+        client.emitToken("first")
+
+        await #expect(throws: AppInferenceArbiterError.transportLost) {
+            _ = try await httpEvents.value
+        }
+        #expect(AppInferenceArbiterError.transportLost.description
+                == AppInferenceArbiterError.transportLostMessage)
+        #expect(AppInferenceArbiterError.transportLost.inferenceError
+                == .unknown(AppInferenceArbiterError.transportLostMessage))
+        // The lease is released and the session is gone with the transport.
+        try await waitUntil { await arbiter.activity == .idle }
+        #expect(recorder.snapshot.last == .idle)
+        #expect(recorder.snapshot.contains { $0.activeOwner == .http(httpID) && $0.loadedSession == Self.session })
+        try await waitUntil { client.shutdownCount == 1 }
+        #expect(client.maxConcurrentStreams == 1)
     }
 
     @Test func watchdogIsResetByEvents() async throws {

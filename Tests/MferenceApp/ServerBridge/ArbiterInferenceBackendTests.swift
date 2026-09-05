@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 import Mference
 import MferenceAppCore
@@ -336,6 +337,152 @@ struct ArbiterInferenceBackendTests {
         await harness.stop()
     }
 
+    @Test func stopRefusesARequestQueuedInTheCoordinator() async throws {
+        let client = BridgeFakeInferenceClient(response: Self.response, pieceDelay: .milliseconds(60))
+        let harness = try await BridgeHarness.start(client: client)
+        let first = Task {
+            try await streamCompletion(Self.body(#","stream":true"#), port: harness.port)
+        }
+        try await waitUntil { await harness.arbiter.activity.activeOwner != nil }
+        let second = Task { try await completion(Self.body(), port: harness.port) }
+        // The second request is rendered and parked in the coordinator's
+        // queue behind the first; its lifecycle row is the last observable
+        // step before the wait.
+        try await waitUntil {
+            await MainActor.run {
+                harness.model.logEntries.filter { entry in
+                    if case .requestStarted = entry.serverEvent?.kind { return true }
+                    return false
+                }.count == 2
+            }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(client.generateCount == 1)
+
+        await harness.stop()
+        #expect(harness.model.runState == .stopped)
+        let reply = try await second.value
+        #expect(reply.status == 503)
+        #expect(errorCode(reply) == "service_unavailable")
+        #expect(errorMessage(reply) == "the server is stopping")
+        // Nothing started a fresh generation during the stop.
+        #expect(client.generateCount == 1)
+        #expect(client.cancelCount == 1)
+        let (status, frames) = try await first.value
+        #expect(status == 200)
+        #expect(frames.last == "[DONE]")
+        #expect(await harness.arbiter.activity.activeOwner == nil)
+    }
+
+    @Test func clientDisconnectIsLoggedAsTheCause() async throws {
+        let client = BridgeFakeInferenceClient(response: Self.response, pieceDelay: .milliseconds(60))
+        let harness = try await BridgeHarness.start(client: client)
+        let sawContent = ContentFlag()
+        let url = harness.completionURL
+        let consumer = Task {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "content-type")
+            request.httpBody = Data(Self.body(#","stream":true"#).utf8)
+            let (bytes, _) = try await URLSession.shared.bytes(for: request)
+            for try await line in bytes.lines where line.contains(#""content""#) {
+                sawContent.set()
+            }
+        }
+        try await waitUntil { sawContent.isSet }
+        // Cancelling the URLSession task closes the socket mid-stream.
+        consumer.cancel()
+        _ = try? await consumer.value
+
+        let disconnected: @Sendable (APIServerLogEntry) -> String? = { entry in
+            if case .requestFailed(let status, let streaming, let detail) = entry.serverEvent?.kind,
+               status == 503, streaming {
+                return detail
+            }
+            return nil
+        }
+        try await waitUntil {
+            await MainActor.run { harness.model.logEntries.contains { disconnected($0) != nil } }
+        }
+        let detail = harness.model.logEntries.compactMap(disconnected).first
+        #expect(detail == "service_unavailable: the client disconnected before the answer completed")
+        // The wire cancel followed the disconnect (the backend's cancellation
+        // handler and the dropped consumer stream each issue one; the second
+        // reaches a session that is already cancelling) and the lease is
+        // released.
+        try await waitUntil { client.cancelCount >= 1 }
+        try await waitUntil { await harness.arbiter.activity.activeOwner == nil }
+        #expect(client.generateCount == 1)
+        await harness.stop()
+    }
+
+    @Test func cancelActiveRequestWithNothingActiveRecordsNoRow() async throws {
+        let harness = try await BridgeHarness.start()
+        #expect(!harness.model.canCancelActiveRequest)
+        harness.model.cancelActiveRequest()
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(!harness.model.logSink.snapshot.entries.contains {
+            $0.bridgeNote == .activeRequestCancelled
+        })
+        await harness.stop()
+    }
+
+    @Test func aRejectedRequestLeavesNoSubstitutionRow() async throws {
+        let harness = try await BridgeHarness.start(
+            session: BridgeFixtures.session(maxContext: 6, forceLogitsHead: false),
+            policy: .pinToSession)
+        let isSubstitution: @Sendable (APIServerLogEntry) -> Bool = { entry in
+            if case .substitution = entry.bridgeNote { return true }
+            return false
+        }
+        // Pinned temperature, but the conversation does not fit: 400, and no
+        // row claims a rewritten request was served.
+        let rejected = try await completion(Self.body(#","temperature":0.9"#, messages: #"""
+        [{"role":"user","content":"one two three four five"},
+         {"role":"assistant","content":"six"},
+         {"role":"user","content":"seven eight"}]
+        """#), port: harness.port)
+        #expect(rejected.status == 400)
+        #expect(errorCode(rejected) == "context_length_exceeded")
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(!harness.model.logSink.snapshot.entries.contains(where: isSubstitution))
+        #expect(harness.client.generateCount == 0)
+
+        // A served request still gets its row.
+        let served = try await completion(Self.body(#","temperature":0.9"#), port: harness.port)
+        #expect(served.status == 200)
+        try await waitUntil {
+            await MainActor.run { harness.model.logEntries.contains(where: isSubstitution) }
+        }
+        await harness.stop()
+    }
+
+    @Test func watchdogTeardownAnswers503AndDropsTheSession() async throws {
+        // One prefill event, then a gap longer than the budget.
+        let client = BridgeFakeInferenceClient(response: Self.response,
+                                               pieceDelay: .milliseconds(120),
+                                               prefillSteps: 1)
+        let harness = try await BridgeHarness.start(client: client, watchdog: .milliseconds(40))
+        let reply = try await completion(Self.body(), port: harness.port)
+        #expect(reply.status == 503)
+        #expect(errorCode(reply) == "service_unavailable")
+        #expect(errorMessage(reply) == AppInferenceArbiterError.transportLostMessage)
+        #expect(client.cancelCount == 1)
+        try await waitUntil {
+            await MainActor.run {
+                harness.model.inferenceActivity.loadedSession == nil
+                    && harness.model.logEntries.contains { $0.bridgeNote == .modelUnloaded }
+            }
+        }
+        #expect(harness.model.runState.isListening)
+        // Until a reload publishes a session, completions are refused.
+        let refused = try await completion(Self.body(), port: harness.port)
+        #expect(refused.status == 503)
+        #expect(errorMessage(refused) == "no model is loaded")
+        #expect(client.generateCount == 1)
+        await harness.stop()
+    }
+
     @Test func stopDrainsAnInFlightRequestBeforeShuttingDown() async throws {
         let client = BridgeFakeInferenceClient(response: Self.response, pieceDelay: .milliseconds(60))
         let harness = try await BridgeHarness.start(client: client)
@@ -353,4 +500,10 @@ struct ArbiterInferenceBackendTests {
         #expect(status == 200)
         #expect(frames.last == "[DONE]")
     }
+}
+
+private final class ContentFlag: Sendable {
+    private let state = Mutex(false)
+    var isSet: Bool { state.withLock { $0 } }
+    func set() { state.withLock { $0 = true } }
 }

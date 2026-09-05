@@ -75,6 +75,12 @@ public final class APIServerModel {
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
     @ObservationIgnored private var activityTask: Task<Void, Never>?
 
+    /// `arbiter` must be the app's one arbiter (`AppModel.arbiter`): exactly
+    /// one `AppInferenceArbiter` may exist per `DecodeServiceInferenceClient`,
+    /// because the decode pipe tolerates a single reader. The composition
+    /// root passes the same instance here and to `AppModel`; building a
+    /// second arbiter, or a second client, for the server puts two readers
+    /// on the pipe.
     public init(arbiter: AppInferenceArbiter,
                 environment: APIServerEnvironment = .live,
                 logCapacity: Int = APIServerLogSink.defaultCapacity,
@@ -149,12 +155,18 @@ public final class APIServerModel {
     }
 
     /// Cancels the HTTP request holding the decode session. Lease scoped: a
-    /// chat generation is never touched. Logged, so the remote client's
-    /// truncated answer has a visible cause.
+    /// chat generation is never touched. Logged once the backend confirms a
+    /// request was actually cancelled, so the remote client's truncated
+    /// answer has a visible cause and a click that lands after the request
+    /// finished leaves no false row.
     public func cancelActiveRequest() {
         guard let backend else { return }
-        logSink.record(APIServerBridgeNote(kind: .activeRequestCancelled))
-        Task { await backend.cancelActiveRequest() }
+        let logSink = logSink
+        Task {
+            if await backend.cancelActiveRequest() {
+                logSink.record(APIServerBridgeNote(kind: .activeRequestCancelled))
+            }
+        }
     }
 
     public func clearLog() {
@@ -237,17 +249,26 @@ public final class APIServerModel {
         }
     }
 
-    /// Drains the bridge's leases first, then shuts the listener down. The
-    /// order is load-bearing: `shutdown()` awaits every in-flight request
-    /// task, and those sit on the decode stream until the wire cancel is
-    /// answered.
+    /// Closes the backend to new generations, drains the bridge's leases,
+    /// then shuts the listener down. The order is load-bearing: `shutdown()`
+    /// awaits every in-flight request task, and those sit on the decode
+    /// stream until the wire cancel is answered; a request the coordinator
+    /// releases after the drain must find the backend already stopping so
+    /// the shutdown never waits on a generation that started during it.
     private func performStop(reason: String) async {
         guard case .listening = runState, let server else { return }
         runState = .stopping
         if let backend {
+            await backend.beginStopping()
             await backend.cancelAllRequests()
+            // Requests the coordinator releases from its queue now answer
+            // 503 at once; wait for that as well, so `shutdown()` finds no
+            // request task between the queue and the backend.
             let deadline = ContinuousClock.now + .seconds(5)
-            while await backend.liveRequestCount > 0, ContinuousClock.now < deadline {
+            while ContinuousClock.now < deadline {
+                let live = await backend.liveRequestCount
+                let queued = await server.queuedRequestCount
+                if live == 0, queued == 0 { break }
                 try? await Task.sleep(for: .milliseconds(10))
             }
         }
