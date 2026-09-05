@@ -90,9 +90,22 @@ let package = Package(
             dependencies: ["MferenceServerCore"],
             path: "Sources/MferenceServer/Command"
         ),
+        // Serves the app's loaded model over the OpenAI-compatible server.
+        // Deliberately a separate target: `MferenceDecodeService` depends on
+        // `MferenceAppCore`, so adding `MferenceServerCore` there would link
+        // SwiftNIO into the process holding the weights.
+        .target(
+            name: "MferenceServerBridge",
+            dependencies: [
+                "MferenceAppCore",
+                "MferenceServerCore",
+                .product(name: "NIOCore", package: "swift-nio"),
+            ],
+            path: "Sources/MferenceApp/ServerBridge"
+        ),
         .executableTarget(
             name: "MferenceMac",
-            dependencies: ["MferenceAppCore", "MferenceMacPresentation"],
+            dependencies: ["MferenceAppCore", "MferenceMacPresentation", "MferenceServerBridge"],
             path: "Sources/MferenceApp/Mac",
             resources: [
                 .copy("Resources/mference-app-icon.png"),
@@ -132,6 +145,11 @@ let package = Package(
             ],
             path: "Tests/MferenceServer",
             resources: [.copy("Fixtures")]
+        ),
+        .testTarget(
+            name: "MferenceServerBridgeTests",
+            dependencies: ["MferenceServerBridge", "MferenceAppCore", "MferenceServerCore"],
+            path: "Tests/MferenceApp/ServerBridge"
         ),
     ]
 )
