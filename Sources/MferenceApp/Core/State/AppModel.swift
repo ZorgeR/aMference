@@ -53,8 +53,17 @@ public final class AppModel {
     public private(set) var livePrefillTotal: Int = 0
     public private(set) var liveMemoryBytes: UInt64?
     public private(set) var isCancellationPending: Bool = false
+    /// Display-only mirror of the arbiter: who holds the decode session and
+    /// who is waiting. Fed from `activityStream`; never gates an action.
+    public private(set) var inferenceActivity: AppInferenceActivity = .idle
 
     private let client: any AppInferenceClient
+    /// Sole caller of `client`. Every generation, load, and unload goes
+    /// through it so nothing else can read the decode pipe concurrently.
+    private let arbiter: AppInferenceArbiter
+    /// Ends on its own: the arbiter finishes every activity stream when it
+    /// deallocates, which follows this model's own deallocation.
+    @ObservationIgnored private var activityTask: Task<Void, Never>?
     private let installer: any AppModelInstallerClient
     private var runTask: Task<Void, Never>?
     private var loadTask: Task<Void, Never>?
@@ -78,6 +87,7 @@ public final class AppModel {
 
     public init(modelDirectory: URL? = nil,
                 client: any AppInferenceClient = RealInferenceClient(),
+                arbiter: AppInferenceArbiter? = nil,
                 installer: any AppModelInstallerClient = RepackModelInstallerClient(descriptor: .selected),
                 memorySampler: AppMemorySampler = AppMemorySampler(),
                 settingsPersistenceEnabled: Bool = false) {
@@ -103,6 +113,7 @@ public final class AppModel {
         self.topP = settings.topP
         self.installationStatus = AppModelInstallationProbe.status(at: directory)
         self.client = client
+        self.arbiter = arbiter ?? AppInferenceArbiter(client: client)
         self.installer = installer
         self.memorySampler = memorySampler
         self.settingsPersistenceEnabled = settingsPersistenceEnabled
@@ -113,6 +124,13 @@ public final class AppModel {
         if let recoveryURL = chatLoadResult.recoveryURL {
             error = .unknown(
                 "The saved chat archive could not be read. A recovery copy was preserved at \(recoveryURL.path).")
+        }
+        let activityStream = self.arbiter.activityStream
+        activityTask = Task { @MainActor [weak self] in
+            for await activity in activityStream {
+                guard let self else { return }
+                self.applyInferenceActivity(activity)
+            }
         }
     }
 
@@ -315,7 +333,8 @@ public final class AppModel {
             generationPhase: phase,
             livePrefillDone: livePrefillDone,
             livePrefillTotal: livePrefillTotal,
-            lastStopReason: diagnostics?.stopReason))
+            lastStopReason: diagnostics?.stopReason,
+            queuedBehindAPIRequest: phase == .queued))
     }
 
     public var currentProcessMemoryBytes: UInt64? {
@@ -378,8 +397,9 @@ public final class AppModel {
         if let lifecycle = client as? AppModelLifecycleClient {
             unloadGeneration &+= 1
             let generation = unloadGeneration
-            let task = Task { [weak self, lifecycle] in
-                await lifecycle.unload()
+            let task = Task { [weak self, lifecycle, arbiter] in
+                await Self.unloadExclusively(lifecycle, via: arbiter,
+                                             reason: "Switching model")
                 self?.clearUnloadTask(generation: generation)
             }
             unloadTask = task
@@ -420,22 +440,38 @@ public final class AppModel {
                                              maxContextTokens: maxContext,
                                              options: options,
                                              forceLogitsHead: forceLogitsHead)
+        let session = AppLoadedSession(
+            modelDirectory: directory,
+            maxContextTokens: maxContext,
+            runtimeOptions: options,
+            forceLogitsHead: forceLogitsHead,
+            temperature: Float(temperature),
+            topK: topKEnabled ? topK : nil,
+            topP: topKEnabled && topPEnabled ? Float(topP) : nil)
         let pendingUnload = unloadTask
         loadGeneration &+= 1
         let generation = loadGeneration
         pendingExplicitLoadRuntimeKey = runtimeKey
         error = nil
         loadState = .loading(.validatingDirectory)
-        loadTask = Task.detached { [weak self, lifecycle, pendingUnload] in
+        loadTask = Task.detached { [weak self, lifecycle, arbiter, pendingUnload] in
             do {
                 await pendingUnload?.value
                 try Task.checkCancellation()
-                try await lifecycle.ensureLoaded(modelDirectory: directory,
-                                                 maxContextTokens: maxContext,
-                                                 options: options,
-                                                 forceLogitsHead: forceLogitsHead) { [weak self] state in
-                    Task { @MainActor in
-                        self?.applyLoadState(state, generation: generation)
+                try await arbiter.withExclusiveSession(reason: "Loading model") { [weak self] in
+                    do {
+                        try await lifecycle.ensureLoaded(modelDirectory: directory,
+                                                         maxContextTokens: maxContext,
+                                                         options: options,
+                                                         forceLogitsHead: forceLogitsHead) { [weak self] state in
+                            Task { @MainActor in
+                                self?.applyLoadState(state, generation: generation)
+                            }
+                        }
+                        await arbiter.publishLoadedSession(session)
+                    } catch {
+                        await arbiter.publishLoadedSession(nil)
+                        throw error
                     }
                 }
             } catch is CancellationError {
@@ -459,8 +495,9 @@ public final class AppModel {
         pendingExplicitLoadRuntimeKey = nil
         unloadGeneration &+= 1
         let generation = unloadGeneration
-        unloadTask = Task { [weak self, lifecycle] in
-            await lifecycle.unload()
+        unloadTask = Task { [weak self, lifecycle, arbiter] in
+            await Self.unloadExclusively(lifecycle, via: arbiter,
+                                         reason: "Cancelling model load")
             guard let self, generation == self.unloadGeneration else { return }
             self.loadedRuntimeKey = nil
             self.loadState = .notLoaded
@@ -473,14 +510,31 @@ public final class AppModel {
         loadState = .unloading
         unloadGeneration &+= 1
         let generation = unloadGeneration
-        unloadTask = Task { [weak self, lifecycle] in
-            await lifecycle.unload()
+        unloadTask = Task { [weak self, lifecycle, arbiter] in
+            await Self.unloadExclusively(lifecycle, via: arbiter,
+                                         reason: "Unloading model")
             guard let self, generation == self.unloadGeneration else { return }
             self.loadedRuntimeKey = nil
             self.liveMemoryBytes = nil
             self.loadState = .notLoaded
             self.clearUnloadTask(generation: generation)
         }
+    }
+
+    /// Unloads behind the arbiter's barrier: any active generation is
+    /// cancelled and drained to its terminal event first, so `unload` never
+    /// reads the decode pipe while a generation is still using it. Unload
+    /// tasks are never cancelled, so the barrier is the only thing that can
+    /// throw here.
+    private nonisolated static func unloadExclusively(
+        _ lifecycle: any AppModelLifecycleClient,
+        via arbiter: AppInferenceArbiter,
+        reason: String
+    ) async {
+        try? await arbiter.withExclusiveSession(reason: reason) {
+            await lifecycle.unload()
+        }
+        await arbiter.publishLoadedSession(nil)
     }
 
     public func installModel() {
@@ -1065,14 +1119,23 @@ public final class AppModel {
     }
 
     private func launchGeneration(_ request: AppGenerationRequest) {
-        runTask = Task.detached { [weak self, client, request] in
+        runTask = Task.detached { [weak self, arbiter, request] in
             guard let self else { return }
             do {
-                for try await event in client.generate(request) {
+                let events = await arbiter.stream(request, owner: .chat)
+                // A Stop that landed before the arbiter knew about this
+                // generation would otherwise be lost; re-issue it now that
+                // the lease (or queue entry) exists.
+                if await self.isCancellationPending {
+                    await arbiter.cancel(owner: .chat)
+                }
+                for try await event in events {
                     await self.apply(event)
                 }
             } catch let appError as AppInferenceError {
                 await self.finishStreamFailure(appError)
+            } catch let arbiterError as AppInferenceArbiterError {
+                await self.finishStreamFailure(arbiterError.inferenceError)
             } catch {
                 await self.finishStreamFailure(.unknown("\(error)"))
             }
@@ -1085,7 +1148,12 @@ public final class AppModel {
         if activeRunChatID == nil {
             runTask?.cancel()
         }
-        client.cancel()
+        // Lease-scoped: a chat generation still queued behind an API request
+        // is dequeued without touching the wire; an active one gets the
+        // client's cancel.
+        Task { [arbiter] in
+            await arbiter.cancel(owner: .chat)
+        }
     }
 
     public func makeRequest() throws -> AppGenerationRequest {
@@ -1480,20 +1548,24 @@ public final class AppModel {
 
         var streamedText = ""
         var didFinish = false
-        for try await event in client.generate(request) {
-            try Task.checkCancellation()
-            switch event {
-            case .prefillProgress:
-                break
-            case .token(let token):
-                streamedText += token.textDelta
-            case .finished:
-                didFinish = true
-            case .cancelled:
-                throw AppInferenceError.cancelled
-            case .failed(let error, _):
-                throw error
+        do {
+            for try await event in await arbiter.stream(request, owner: .chat) {
+                try Task.checkCancellation()
+                switch event {
+                case .prefillProgress:
+                    break
+                case .token(let token):
+                    streamedText += token.textDelta
+                case .finished:
+                    didFinish = true
+                case .cancelled:
+                    throw AppInferenceError.cancelled
+                case .failed(let error, _):
+                    throw error
+                }
             }
+        } catch let arbiterError as AppInferenceArbiterError {
+            throw arbiterError.inferenceError
         }
         try Task.checkCancellation()
         guard didFinish else {
@@ -1518,6 +1590,18 @@ public final class AppModel {
         outputPromptText = ""
         outputText = ""
         finishTerminalRun()
+    }
+
+    private func applyInferenceActivity(_ activity: AppInferenceActivity) {
+        inferenceActivity = activity
+        // Only a committed chat generation shows the queued phase; while the
+        // request is still being prepared the phase already says so.
+        guard isRunning, activeRunChatID != nil else { return }
+        if activity.queuedChat {
+            phase = .queued
+        } else if phase == .queued {
+            phase = .prefill
+        }
     }
 
     func apply(_ event: AppInferenceEvent) {

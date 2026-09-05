@@ -6,12 +6,20 @@ import MferenceDecodeProtocol
 
 public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
     AppGenerationContextReporting, AppInferenceMemoryReporting,
-    AppInferenceTranscriptReporting, @unchecked Sendable {
+    AppInferenceTranscriptReporting, AppInferenceDeltaStreaming,
+    AppInferenceTransportControlling, @unchecked Sendable {
     private struct Connection {
         var input: FileHandle?
         var output: FileHandle?
         var loadedDirectory: URL?
         var process: Process?
+
+        /// A spawned service is alive while its process runs. A test
+        /// transport has no process and is alive while both handles are set.
+        var isAlive: Bool {
+            if let process { return process.isRunning }
+            return input != nil && output != nil
+        }
     }
 
     private let connection = Mutex(Connection())
@@ -27,6 +35,21 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
 
     public init(serviceURL: URL? = nil) {
         self.serviceURL = serviceURL ?? Self.defaultServiceURL()
+    }
+
+    /// Test seam: binds the client to a transport the caller already owns
+    /// instead of spawning `MferenceDecodeService`. Command frames are
+    /// written to `input`; event frames are read from `output`. The client
+    /// behaves as if `loadedDirectory` had been loaded through `ensureLoaded`,
+    /// and `shutdown()` closes both handles.
+    init(transportInput input: FileHandle, transportOutput output: FileHandle,
+         loadedDirectory: URL) {
+        self.serviceURL = URL(fileURLWithPath: "/dev/null")
+        connection.withLock {
+            $0.input = input
+            $0.output = output
+            $0.loadedDirectory = loadedDirectory.standardizedFileURL
+        }
     }
 
     public func ensureLoaded(modelDirectory: URL, maxContextTokens: Int,
@@ -69,6 +92,15 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
     }
 
     public func generate(_ request: AppGenerationRequest)
+        -> AsyncThrowingStream<AppInferenceEvent, Error> {
+        generate(request, onTextDelta: { _ in })
+    }
+
+    /// `onTextDelta` receives the text of every snapshot frame as it arrives,
+    /// before the 0.5 s `.token` throttle below decides whether to surface
+    /// it as an event. It runs on the reader task and must not block.
+    public func generate(_ request: AppGenerationRequest,
+                         onTextDelta: @escaping @Sendable (String) -> Void)
         -> AsyncThrowingStream<AppInferenceEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [self] in
@@ -115,6 +147,7 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
                         }
                         if event.kind == .snapshot {
                             generationTranscriptMailbox.append(event.textDelta)
+                            onTextDelta(event.textDelta)
                             let now = Date()
                             let beginsVisibleText = !hasYieldedVisibleText
                                 && event.textDelta.contains { !$0.isWhitespace }
@@ -153,7 +186,14 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
                     continuation.finish(throwing: error)
                 }
             }
-            continuation.onTermination = { [weak self] _ in
+            // The wire `cancel` is payload-free and applies to whatever the
+            // service is running, so it must go out only when this consumer
+            // stops listening early (`.cancelled`: the iterating task was
+            // cancelled or the iterator was dropped). On normal completion
+            // (`.finished`) the service is already idle, and a cancel sent
+            // then would hit the next generation queued behind this one.
+            continuation.onTermination = { [weak self] termination in
+                guard case .cancelled = termination else { return }
                 task.cancel()
                 self?.cancel()
             }
@@ -238,7 +278,7 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
             handles: (input: FileHandle, output: FileHandle)?,
             stale: Connection?
         ) = connection.withLock { state in
-            guard state.process?.isRunning == true,
+            guard state.isAlive,
                   let input = state.input, let output = state.output else {
                 let stale = state
                 state = Connection()
@@ -256,7 +296,7 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
             handles: (input: FileHandle, output: FileHandle)?,
             stale: Connection?
         ) = connection.withLock { state in
-            guard state.process?.isRunning == true else {
+            guard state.isAlive else {
                 let stale = state
                 state = Connection()
                 return (handles: nil, stale: stale)

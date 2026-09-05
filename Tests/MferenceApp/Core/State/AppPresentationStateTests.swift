@@ -93,6 +93,39 @@ import Testing
         }
     }
 
+    @Test func queuedBehindAnAPIRequestIsVisibleAndActive() {
+        let ready = AppModelLoadState.ready(
+            modelDirectory: URL(fileURLWithPath: "/tmp/model.gturbo"),
+            loadSeconds: 1)
+        var snapshot = Self.installedSnapshot(loadState: ready)
+        snapshot.isRunning = true
+        snapshot.generationPhase = .prefill
+        snapshot.queuedBehindAPIRequest = true
+
+        var state = AppPresentationState.resolve(snapshot)
+        #expect(state.label == "Waiting for an API request")
+        #expect(state.severity == .active)
+        #expect(state.showsActivity)
+        #expect(state.primaryAction == nil)
+
+        snapshot.queuedBehindAPIRequest = false
+        snapshot.generationPhase = .queued
+        state = AppPresentationState.resolve(snapshot)
+        #expect(state.label == "Waiting for an API request")
+        #expect(state.showsActivity)
+
+        // Stopping still wins over the queued label.
+        snapshot.isGenerationCancellationPending = true
+        #expect(AppPresentationState.resolve(snapshot).label == "Stopping")
+
+        // The flag means nothing once the generation is over.
+        snapshot.isGenerationCancellationPending = false
+        snapshot.isRunning = false
+        snapshot.generationPhase = .idle
+        snapshot.queuedBehindAPIRequest = true
+        #expect(AppPresentationState.resolve(snapshot).label == "Ready")
+    }
+
     @Test func prefillProgressUsesCompactFractionLabel() {
         let ready = AppModelLoadState.ready(
             modelDirectory: URL(fileURLWithPath: "/tmp/model.gturbo"),

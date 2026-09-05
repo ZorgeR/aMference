@@ -45,6 +45,8 @@ public enum AppModelLoadState: Equatable, Sendable {
 public enum AppGenerationPhase: String, Equatable, Sendable {
     case idle
     case compressing
+    /// Committed and waiting behind an API request that holds the decode session.
+    case queued
     case prefill
     case decode
 }

@@ -30,6 +30,9 @@ public struct AppPresentationSnapshot: Equatable, Sendable {
     public var livePrefillDone: Int
     public var livePrefillTotal: Int
     public var lastStopReason: AppStopReason?
+    /// The chat generation is committed but waiting for an API request that
+    /// holds the decode session to finish.
+    public var queuedBehindAPIRequest: Bool
 
     public init(requiresInstallation: Bool,
                 installState: AppModelInstallState,
@@ -41,7 +44,8 @@ public struct AppPresentationSnapshot: Equatable, Sendable {
                 generationPhase: AppGenerationPhase,
                 livePrefillDone: Int = 0,
                 livePrefillTotal: Int = 0,
-                lastStopReason: AppStopReason? = nil) {
+                lastStopReason: AppStopReason? = nil,
+                queuedBehindAPIRequest: Bool = false) {
         self.requiresInstallation = requiresInstallation
         self.installState = installState
         self.installReadiness = installReadiness
@@ -53,6 +57,7 @@ public struct AppPresentationSnapshot: Equatable, Sendable {
         self.livePrefillDone = livePrefillDone
         self.livePrefillTotal = livePrefillTotal
         self.lastStopReason = lastStopReason
+        self.queuedBehindAPIRequest = queuedBehindAPIRequest
     }
 }
 
@@ -144,9 +149,16 @@ public struct AppPresentationState: Equatable, Sendable {
             if snapshot.isGenerationCancellationPending {
                 return Self(label: "Stopping", severity: .active, showsActivity: true)
             }
+            if snapshot.queuedBehindAPIRequest {
+                return Self(label: "Waiting for an API request", severity: .active,
+                            showsActivity: true)
+            }
             switch snapshot.generationPhase {
             case .compressing:
                 return Self(label: "Compressing history", severity: .active,
+                            showsActivity: true)
+            case .queued:
+                return Self(label: "Waiting for an API request", severity: .active,
                             showsActivity: true)
             case .prefill:
                 let label = snapshot.livePrefillTotal > 0
