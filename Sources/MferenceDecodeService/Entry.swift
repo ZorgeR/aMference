@@ -4,9 +4,20 @@ import MferenceDecodeProtocol
 
 @main enum MferenceDecodeServiceMain {
     static func main() async {
+        // Claim the frame channel before anything else runs: from here on the
+        // only writer to the parent's stream is `frameChannel`, and fd 1 is an
+        // alias of stderr so a stray `print()` cannot corrupt a session.
+        let frameChannel: FileHandle
+        do {
+            frameChannel = try FrameChannelClaim.claim()
+        } catch {
+            FileHandle.standardError.write(Data(
+                "decode service could not claim its frame channel: \(error)\n".utf8))
+            exit(EXIT_FAILURE)
+        }
         let handles = (
             input: FileHandle.standardInput,
-            output: FileHandle.standardOutput)
+            output: frameChannel)
 
         let client = RealInferenceClient()
         let commands = DecodeCommandQueue()
