@@ -26,6 +26,23 @@ public protocol AppModelLifecycleClient: AnyObject, AppInferenceClient {
     func unload() async
 }
 
+/// A client that can hand every text fragment the transport delivers to a
+/// caller-supplied hook, independent of the throttled `.token` cadence of
+/// `AppInferenceEvent`. The hook runs on the client's reader context and
+/// must not block.
+public protocol AppInferenceDeltaStreaming: AppInferenceClient {
+    func generate(_ request: AppGenerationRequest,
+                  onTextDelta: @escaping @Sendable (String) -> Void)
+        -> AsyncThrowingStream<AppInferenceEvent, Error>
+}
+
+/// A client whose transport can be torn down out of band when it stops
+/// responding. `AppInferenceArbiter`'s watchdog calls it after `cancel()`
+/// when a generation has produced no event for the watchdog duration.
+public protocol AppInferenceTransportControlling: AnyObject, AppInferenceClient {
+    func shutdown()
+}
+
 public protocol AppInferenceMemoryReporting: AnyObject {
     var currentInferenceMemoryBytes: UInt64? { get }
 }
