@@ -118,8 +118,9 @@ public actor AppInferenceArbiter {
     }
 
     private let client: any AppInferenceClient
-    /// `nil` disables the watchdog.
-    private let watchdogDuration: Duration?
+    /// `nil` disables the watchdog. Internal so tests can assert the
+    /// configuration rather than infer it from a bounded silence.
+    nonisolated let watchdogDuration: Duration?
     private let broadcaster: AppInferenceActivityBroadcaster
     private var active: AppInferenceActiveLease?
     private var waiters = AppInferenceWaiterQueue()
@@ -133,6 +134,13 @@ public actor AppInferenceArbiter {
     /// `DecodeServiceInferenceClient` are two readers on the same pipe. The
     /// composition root creates the arbiter once and hands the same instance
     /// to every consumer (`AppModel`, `APIServerModel`).
+    ///
+    /// The watchdog is opt-in: `watchdog` defaults to `nil`, and when it is
+    /// set the idle clock starts at the first event of a generation, after
+    /// which `watchdog` of silence fails the lease with `.transportLost` and
+    /// publishes `loadedSession == nil`. Enabling it by default waits on a
+    /// service-side heartbeat frame: prefill emits one frame per chunk, so
+    /// no fixed budget is both safe for a long chunk and useful for a wedge.
     ///
     /// - Parameter watchdog: silence budget between events of one
     ///   generation, measured from its first event; `nil` (the default)
@@ -501,21 +509,28 @@ public actor AppInferenceArbiter {
         }
     }
 
-    /// Cancel on the wire, fail the lease with `.transportLost`, drop the
-    /// published session, then tear the transport down off the actor:
+    /// Cancel on the wire, kill the pipe, drop the published session, fail
+    /// the lease with `.transportLost`, then reap the process off the actor.
+    /// The order is load-bearing: `disconnect()` is synchronous and cheap
+    /// (it only swaps the handles out and closes them) and runs before
+    /// `finishGeneration` lifts the lease, so whoever admission hands the
+    /// session to next — a queued waiter, or a load parked on the exclusive
+    /// barrier — finds a client with no handles and no session, never a
+    /// second reader on a pipe that is being torn down. The process wait in
     /// `DecodeServiceInferenceClient.shutdown()` polls the child for up to
     /// ~750 ms and must never stall admission, cancel, or activity
-    /// publication while it does.
+    /// publication, so it runs detached.
     private func fireWatchdog(generationID: UUID, ticket: AppInferenceLeaseTicket) {
         guard let lease = active, lease.ticket == ticket,
               lease.generation?.id == generationID else { return }
         client.cancel()
         forwardingTasks[generationID]?.cancel()
+        let transport = client as? any AppInferenceTransportControlling
+        transport?.disconnect()
+        loadedSessionValue = nil
         finishGeneration(generationID, ticket: ticket,
                          outcome: .failure(AppInferenceArbiterError.transportLost))
-        loadedSessionValue = nil
-        publishActivity()
-        if let transport = client as? any AppInferenceTransportControlling {
+        if let transport {
             Task.detached { transport.shutdown() }
         }
     }

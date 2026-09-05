@@ -23,6 +23,9 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
     }
 
     private let connection = Mutex(Connection())
+    /// Spawned processes whose pipes `disconnect()` closed; `shutdown()`
+    /// reaps them.
+    private let condemned = Mutex<[Process]>([])
     private let commandWrites = Mutex(())
     private let processCreation = Mutex(())
     private let serviceURL: URL
@@ -216,25 +219,43 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
         try? write(DecodeServiceCommand.cancel, to: input)
     }
 
+    /// The cheap half of a teardown: the handles are closed and forgotten
+    /// at once, so `handles(forLoadedDirectory:)` and `currentHandles()`
+    /// answer nil from here on and a reader blocked on the pipe wakes with
+    /// EOF; a spawned process is set aside for `shutdown()` to reap. Never
+    /// blocks and never takes `processCreation`, which `shutdown()` holds
+    /// while it waits: the arbiter's watchdog calls this on its actor
+    /// before it releases the lease.
+    public func disconnect() {
+        let state = connection.withLock { value -> Connection in
+            defer { value = Connection() }
+            return value
+        }
+        try? state.input?.close()
+        try? state.output?.close()
+        if let process = state.process {
+            condemned.withLock { $0.append(process) }
+        }
+        inferenceMemory.withLock { $0 = nil }
+    }
+
+    /// Closes the connection, if one is still open, and reaps its process
+    /// and every process `disconnect()` set aside, waiting up to ~750 ms
+    /// for each.
     public func shutdown() {
         processCreation.withLock { _ in
             let state = connection.withLock { value -> Connection in
                 defer { value = Connection() }
                 return value
             }
-            if let input = state.input {
-                try? input.close()
+            try? state.input?.close()
+            try? state.output?.close()
+            var processes = condemned.withLock { value -> [Process] in
+                defer { value.removeAll() }
+                return value
             }
-            if let output = state.output { try? output.close() }
-            if let process = state.process, process.isRunning {
-                if !Self.waitForExit(process, milliseconds: 250), process.isRunning {
-                    process.terminate()
-                    if !Self.waitForExit(process, milliseconds: 250), process.isRunning {
-                        _ = Darwin.kill(process.processIdentifier, SIGKILL)
-                        _ = Self.waitForExit(process, milliseconds: 250)
-                    }
-                }
-            }
+            if let process = state.process { processes.append(process) }
+            for process in processes { Self.reap(process) }
         }
         inferenceMemory.withLock { $0 = nil }
     }
@@ -324,6 +345,17 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
         try? stale.output?.close()
         if connection.withLock({ $0.process == nil }) {
             inferenceMemory.withLock { $0 = nil }
+        }
+    }
+
+    private static func reap(_ process: Process) {
+        guard process.isRunning else { return }
+        if !waitForExit(process, milliseconds: 250), process.isRunning {
+            process.terminate()
+            if !waitForExit(process, milliseconds: 250), process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                _ = waitForExit(process, milliseconds: 250)
+            }
         }
     }
 

@@ -82,9 +82,11 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
             log.record(APIServerBridgeNote(kind: .modelNotLoaded))
             throw ServerRequestError.unavailable("no model is loaded")
         }
-        // Substitutions are carried in the plan and logged when `generate`
-        // starts: a request the context guard below rejects with 400 must not
-        // leave "pinned" rows that suggest a rewritten request was served.
+        // Substitutions are carried in the plan and logged by `run` once the
+        // lease is held and the session check has passed: a request refused
+        // earlier (400 here, 429 at the busy timeout, 503 for a session that
+        // went away) must not leave "pinned" rows that suggest a rewritten
+        // request was served.
         let (translated, substitutions) = try ArbiterRequestTranslation.translate(
             request, session: session, policy: policy)
         let measured: APIServerPromptMeasurement
@@ -119,12 +121,7 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
         }
         // A request released from the coordinator's queue after the stop
         // drain must not start a fresh generation the shutdown then waits on.
-        guard !stopping else {
-            throw ServerRequestError.unavailable("the server is stopping")
-        }
-        for substitution in plan.substitutions {
-            log.record(APIServerBridgeNote(kind: .substitution(substitution)))
-        }
+        guard !stopping else { throw Self.serverStopping }
         let id = UUID()
         let owner = AppInferenceOwner.http(id)
         live.insert(id)
@@ -141,6 +138,15 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
             ticket = try await arbiter.acquire(owner, timeout: busyTimeout)
         } catch {
             throw Self.map(error)
+        }
+        // `beginStopping()` can land while this request is between the guard
+        // above and its place in the arbiter's queue, where
+        // `cancelAllRequests()` has nothing to reach. The flag is consistent
+        // here (`generate` resumes on this actor) and the lease is held, so
+        // this check is the durable one: the ticket goes straight back.
+        if stopping {
+            await arbiter.release(ticket)
+            throw Self.serverStopping
         }
         activeRequest = id
         let outcome: Result<ServerCompletion, any Error>
@@ -191,6 +197,10 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
         guard let session = await arbiter.loadedSession, session == plan.session else {
             throw ServerRequestError.unavailable(
                 "the model was unloaded or reloaded while the request waited")
+        }
+        // Only now is a rewritten request about to be served.
+        for substitution in plan.substitutions {
+            log.record(APIServerBridgeNote(kind: .substitution(substitution)))
         }
         let filter = StopFilter(stops: plan.stopStrings)
         let arbiter = self.arbiter
@@ -320,6 +330,9 @@ public actor ArbiterInferenceBackend: ServerInferenceBackend {
     /// the cancellation before or after the service's `.cancelled` event.
     static let clientDisconnected =
         ServerRequestError.unavailable("the client disconnected before the answer completed")
+
+    /// Answered from `beginStopping()` on, both before and after admission.
+    static let serverStopping = ServerRequestError.unavailable("the server is stopping")
 
     private static func cancelledError() -> any Error {
         Task.isCancelled

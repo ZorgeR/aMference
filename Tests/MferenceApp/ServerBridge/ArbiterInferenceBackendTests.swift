@@ -374,6 +374,41 @@ struct ArbiterInferenceBackendTests {
         #expect(await harness.arbiter.activity.activeOwner == nil)
     }
 
+    /// `beginStopping()` lands while a request is parked ahead of its lease
+    /// (inside `acquire`, holding nothing yet). A request that has not
+    /// reached the arbiter's queue is out of `cancelAllRequests()`'s reach,
+    /// so the check that counts is the one after admission: once the chat
+    /// releases, the request is admitted, hands its ticket straight back,
+    /// and answers 503 without a generation ever starting.
+    @Test func stopRefusesARequestAdmittedAfterStoppingBegan() async throws {
+        let client = BridgeFakeInferenceClient(response: Self.response)
+        let arbiter = AppInferenceArbiter(client: client)
+        await arbiter.publishLoadedSession(BridgeFixtures.session())
+        let sink = APIServerLogSink(flushDelay: .milliseconds(1))
+        let backend = ArbiterInferenceBackend(arbiter: arbiter, log: sink,
+                                              policy: .rejectOnMismatch,
+                                              measurePrompt: BridgeFixtures.wordCountMeasurer)
+        let chat = try await arbiter.acquire(.chat, timeout: nil)
+        let prepared = try await backend.prepare(try BridgeFixtures.validated(Self.body()))
+        let request = Task { try await backend.generate(prepared) { _ in } }
+        try await waitUntil { await arbiter.activity.queuedHTTPCount == 1 }
+        #expect(await backend.liveRequestCount == 1)
+
+        await backend.beginStopping()
+        await arbiter.release(chat)
+
+        await #expect(throws: ServerRequestError.unavailable("the server is stopping")) {
+            _ = try await request.value
+        }
+        #expect(client.generateCount == 0)
+        #expect(client.cancelCount == 0)
+        #expect(await backend.liveRequestCount == 0)
+        #expect(!(await backend.hasActiveRequest))
+        try await waitUntil { await arbiter.activity.activeOwner == nil }
+        #expect(await arbiter.activity.queuedHTTPCount == 0)
+        #expect(!sink.snapshot.entries.contains { $0.bridgeNote == .activeRequestCancelled })
+    }
+
     @Test func clientDisconnectIsLoggedAsTheCause() async throws {
         let client = BridgeFakeInferenceClient(response: Self.response, pieceDelay: .milliseconds(60))
         let harness = try await BridgeHarness.start(client: client)
@@ -430,7 +465,8 @@ struct ArbiterInferenceBackendTests {
     @Test func aRejectedRequestLeavesNoSubstitutionRow() async throws {
         let harness = try await BridgeHarness.start(
             session: BridgeFixtures.session(maxContext: 6, forceLogitsHead: false),
-            policy: .pinToSession)
+            policy: .pinToSession,
+            busyTimeout: .milliseconds(150))
         let isSubstitution: @Sendable (APIServerLogEntry) -> Bool = { entry in
             if case .substitution = entry.bridgeNote { return true }
             return false
@@ -444,6 +480,17 @@ struct ArbiterInferenceBackendTests {
         """#), port: harness.port)
         #expect(rejected.status == 400)
         #expect(errorCode(rejected) == "context_length_exceeded")
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(!harness.model.logSink.snapshot.entries.contains(where: isSubstitution))
+        #expect(harness.client.generateCount == 0)
+
+        // Pinned temperature, but the chat holds the session past the busy
+        // timeout: 429, and again no row for a request that never generated.
+        let chat = try await harness.arbiter.acquire(.chat, timeout: nil)
+        let busy = try await completion(Self.body(#","temperature":0.9"#), port: harness.port)
+        #expect(busy.status == 429)
+        #expect(errorCode(busy) == "queue_full")
+        await harness.arbiter.release(chat)
         try await Task.sleep(for: .milliseconds(60))
         #expect(!harness.model.logSink.snapshot.entries.contains(where: isSubstitution))
         #expect(harness.client.generateCount == 0)

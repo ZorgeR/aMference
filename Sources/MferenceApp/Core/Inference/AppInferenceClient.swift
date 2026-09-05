@@ -37,10 +37,18 @@ public protocol AppInferenceDeltaStreaming: AppInferenceClient {
 }
 
 /// A client whose transport can be torn down out of band when it stops
-/// responding. `AppInferenceArbiter`'s watchdog calls it, off the actor,
-/// after `cancel()` when a generation that has already produced an event
-/// then stays silent for the watchdog duration.
+/// responding. `AppInferenceArbiter`'s watchdog calls both halves, after
+/// `cancel()`, when a generation that has already produced an event then
+/// stays silent for the watchdog duration: `disconnect()` on the actor
+/// before the lease is released, so the next admitted owner finds no live
+/// pipe, then `shutdown()` off the actor.
 public protocol AppInferenceTransportControlling: AnyObject, AppInferenceClient {
+    /// Synchronous and non-blocking: drops the transport's handles at once,
+    /// so every later `generate`, `cancel`, or load finds no connection.
+    /// Never waits on a process.
+    func disconnect()
+    /// Reaps the process behind the transport; may wait for it to exit. A
+    /// transport that was `disconnect()`ed first is reaped here too.
     func shutdown()
 }
 

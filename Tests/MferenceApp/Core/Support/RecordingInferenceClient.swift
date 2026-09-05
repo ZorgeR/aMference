@@ -8,7 +8,7 @@ import Synchronization
 final class RecordingInferenceClient: AppInferenceClient,
     AppInferenceTransportControlling, @unchecked Sendable {
     private let wrapped: any AppInferenceClient
-    private let counts = Mutex((generate: 0, cancel: 0, shutdown: 0))
+    private let counts = Mutex((generate: 0, cancel: 0, disconnect: 0, shutdown: 0))
 
     init(wrapping wrapped: any AppInferenceClient) {
         self.wrapped = wrapped
@@ -16,6 +16,7 @@ final class RecordingInferenceClient: AppInferenceClient,
 
     var generateCount: Int { counts.withLock { $0.generate } }
     var cancelCount: Int { counts.withLock { $0.cancel } }
+    var disconnectCount: Int { counts.withLock { $0.disconnect } }
     var shutdownCount: Int { counts.withLock { $0.shutdown } }
 
     func generate(_ request: AppGenerationRequest)
@@ -27,6 +28,11 @@ final class RecordingInferenceClient: AppInferenceClient,
     func cancel() {
         counts.withLock { $0.cancel += 1 }
         wrapped.cancel()
+    }
+
+    func disconnect() {
+        counts.withLock { $0.disconnect += 1 }
+        (wrapped as? any AppInferenceTransportControlling)?.disconnect()
     }
 
     func shutdown() {

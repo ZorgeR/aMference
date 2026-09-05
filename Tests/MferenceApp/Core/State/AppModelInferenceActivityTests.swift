@@ -187,6 +187,7 @@ import Testing
         for _ in 0..<200 where client.shutdownCount == 0 {
             try await Task.sleep(for: .milliseconds(5))
         }
+        #expect(client.disconnectCount == 1)
         #expect(client.shutdownCount == 1)
     }
 
@@ -256,6 +257,14 @@ import Testing
     /// after it lifts (what an HTTP `generate` takes first) never sees the
     /// old session, so a request that raced the unload is refused with no
     /// model rather than sent to an unloaded service.
+    ///
+    /// The probe is a race by construction. Against the wrong ordering (the
+    /// session cleared after the barrier lifts) it catches the stale session
+    /// only when its admission and its read both land before the late
+    /// `publishLoadedSession(nil)` is serviced, which one cycle misses more
+    /// often than not. The cycle therefore repeats, reloading in between:
+    /// 30 rounds fail the wrong ordering with high probability, while the
+    /// right ordering passes every round deterministically.
     @MainActor
     @Test func unloadClearsTheSessionBeforeAdmissionReopens() async throws {
         let directory = try makeCompleteModelInstall("arbiter-unload-order")
@@ -263,47 +272,53 @@ import Testing
         let lifecycle = MockLifecycleInferenceClient()
         let arbiter = AppInferenceArbiter(client: lifecycle)
         let model = AppModel(modelDirectory: directory, client: lifecycle, arbiter: arbiter)
-        model.loadModel()
-        for _ in 0..<200 where !model.loadState.isReady {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        for _ in 0..<200 where model.inferenceActivity.loadedSession == nil {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        #expect(await arbiter.loadedSession != nil)
 
-        lifecycle.suspendUnloads = true
-        model.unloadModel()
-        await lifecycle.waitForUnloadStart()
-        // Behind the barrier every admission is refused outright.
-        await #expect(throws: AppInferenceArbiterError.unavailable("Unloading model")) {
-            _ = try await arbiter.acquire(.http(UUID()), timeout: nil)
-        }
+        for round in 1...30 {
+            model.loadModel()
+            for _ in 0..<200 where !model.loadState.isReady {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            for _ in 0..<200 where model.inferenceActivity.loadedSession == nil {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            #expect(await arbiter.loadedSession != nil, "round \(round): no session after load")
 
-        // Spin on admission; the first ticket granted is the first thing
-        // through after the barrier lifts.
-        let httpID = UUID()
-        let probe = Task { () throws -> AppLoadedSession? in
-            while true {
-                do {
-                    let ticket = try await arbiter.acquire(.http(httpID), timeout: nil)
-                    let seen = await arbiter.loadedSession
-                    await arbiter.release(ticket)
-                    return seen
-                } catch let error as AppInferenceArbiterError {
-                    guard case .unavailable = error else { throw error }
-                    try await Task.sleep(for: .microseconds(200))
+            lifecycle.suspendUnloads = true
+            model.unloadModel()
+            await lifecycle.waitForUnloadStart(round)
+            if round == 1 {
+                // Behind the barrier every admission is refused outright.
+                await #expect(throws: AppInferenceArbiterError.unavailable("Unloading model")) {
+                    _ = try await arbiter.acquire(.http(UUID()), timeout: nil)
                 }
             }
-        }
-        lifecycle.releaseUnloads()
-        let seen = try await probe.value
-        #expect(seen == nil)
 
-        for _ in 0..<200 where model.loadState != .notLoaded {
-            try await Task.sleep(for: .milliseconds(5))
+            // Spin on admission; the first ticket granted is the first thing
+            // through after the barrier lifts.
+            let httpID = UUID()
+            let probe = Task { () throws -> AppLoadedSession? in
+                while true {
+                    do {
+                        let ticket = try await arbiter.acquire(.http(httpID), timeout: nil)
+                        let seen = await arbiter.loadedSession
+                        await arbiter.release(ticket)
+                        return seen
+                    } catch let error as AppInferenceArbiterError {
+                        guard case .unavailable = error else { throw error }
+                        try await Task.sleep(for: .microseconds(200))
+                    }
+                }
+            }
+            lifecycle.releaseUnloads()
+            let seen = try await probe.value
+            #expect(seen == nil, "round \(round): admitted over a stale session")
+
+            for _ in 0..<200 where model.loadState != .notLoaded {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            #expect(model.loadState == .notLoaded, "round \(round)")
         }
-        #expect(model.loadState == .notLoaded)
+
         for _ in 0..<200 where model.inferenceActivity.loadedSession != nil {
             try await Task.sleep(for: .milliseconds(5))
         }

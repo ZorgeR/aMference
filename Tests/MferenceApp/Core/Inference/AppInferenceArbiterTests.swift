@@ -290,7 +290,16 @@ import Testing
         maxContextTokens: 4_096, runtimeOptions: AppRuntimeOptions(),
         forceLogitsHead: true, temperature: 0.2, topK: 64, topP: 0.95)
 
-    @Test func watchdogIsOffByDefault() async throws {
+    @Test func watchdogIsOffByDefault() {
+        #expect(AppInferenceArbiter(client: ScriptedInferenceClient()).watchdogDuration == nil)
+        #expect(AppInferenceArbiter(client: ScriptedInferenceClient(),
+                                    watchdog: .seconds(180)).watchdogDuration == .seconds(180))
+    }
+
+    /// The behavioural half: a short silence after the first event is not a
+    /// teardown. It is bounded by what a test can wait for, so it is not
+    /// proof of the default; `watchdogIsOffByDefault` asserts that.
+    @Test func withoutAWatchdogSilenceAfterTheFirstEventIsNotATeardown() async throws {
         let client = ScriptedInferenceClient()
         let arbiter = AppInferenceArbiter(client: client)
         let chatEvents = Task {
@@ -300,6 +309,7 @@ import Testing
         client.emitToken("first")
         try await Task.sleep(for: .milliseconds(120))
         #expect(client.cancelCount == 0)
+        #expect(client.disconnectCount == 0)
         #expect(client.shutdownCount == 0)
         client.finishCurrent()
         let events = try await chatEvents.value
@@ -323,6 +333,7 @@ import Testing
         // inside its first prefill chunk (first-touch hashing included).
         try await Task.sleep(for: .milliseconds(160))
         #expect(client.cancelCount == 0)
+        #expect(client.disconnectCount == 0)
         #expect(client.shutdownCount == 0)
         #expect(await arbiter.activity.activeOwner == .chat)
         #expect(await arbiter.loadedSession == Self.session)
@@ -337,6 +348,7 @@ import Testing
         }
         #expect(failure == .transportLost)
         #expect(client.cancelCount == 1)
+        #expect(client.disconnectCount == 1)
         try await waitUntil { client.shutdownCount == 1 }
         #expect(await arbiter.loadedSession == nil)
         try await waitUntil { await arbiter.activity == .idle }
@@ -367,8 +379,83 @@ import Testing
         try await waitUntil { await arbiter.activity == .idle }
         #expect(recorder.snapshot.last == .idle)
         #expect(recorder.snapshot.contains { $0.activeOwner == .http(httpID) && $0.loadedSession == Self.session })
+        #expect(client.disconnectCount == 1)
         try await waitUntil { client.shutdownCount == 1 }
         #expect(client.maxConcurrentStreams == 1)
+    }
+
+    /// A waiter queued behind the watchdogged generation is admitted only
+    /// once the pipe is dead: `disconnect()` runs on the actor before the
+    /// lease is released, so the next owner fails on the client's missing
+    /// handles instead of opening a second reader on a transport that is
+    /// being torn down.
+    @Test func watchdogKillsThePipeBeforeTheNextOwnerIsAdmitted() async throws {
+        let client = ScriptedInferenceClient()
+        client.cancelEmitsTerminal = false
+        let arbiter = AppInferenceArbiter(client: client, watchdog: .milliseconds(40))
+        await arbiter.publishLoadedSession(Self.session)
+        let chatEvents = Task {
+            try await collect(await arbiter.stream(Self.request, owner: .chat))
+        }
+        try await waitUntil { client.generateCount == 1 }
+        let httpID = UUID()
+        let httpEvents = Task {
+            try await collect(await arbiter.stream(Self.request, owner: .http(httpID)))
+        }
+        try await waitUntil { await arbiter.activity.queuedHTTPCount == 1 }
+
+        client.emitToken("first")
+        await #expect(throws: AppInferenceArbiterError.transportLost) {
+            _ = try await chatEvents.value
+        }
+        await #expect(throws: AppInferenceError.modelNotLoaded) {
+            _ = try await httpEvents.value
+        }
+        #expect(client.disconnectCount == 1)
+        #expect(client.generateCount == 1, "no second generation reached the transport")
+        #expect(client.refusedGenerateCount == 1)
+        #expect(client.maxConcurrentStreams == 1)
+        #expect(client.cancelCount == 1)
+        #expect(await arbiter.loadedSession == nil)
+        try await waitUntil { client.shutdownCount == 1 }
+        try await waitUntil { await arbiter.activity == .idle }
+    }
+
+    /// The same teardown with an explicit `acquire` waiter behind it, the
+    /// shape an HTTP request takes: the ticket is handed out with the session
+    /// already gone, so the bridge's session check refuses the request before
+    /// it touches the client.
+    @Test func watchdogDropsTheSessionBeforeAnExplicitWaiterIsAdmitted() async throws {
+        let client = ScriptedInferenceClient()
+        client.cancelEmitsTerminal = false
+        let arbiter = AppInferenceArbiter(client: client, watchdog: .milliseconds(40))
+        await arbiter.publishLoadedSession(Self.session)
+        let recorder = ActivityRecorder(arbiter.activityStream)
+        try await waitUntil { recorder.count == 1 }
+        let chatEvents = Task {
+            try await collect(await arbiter.stream(Self.request, owner: .chat))
+        }
+        try await waitUntil { client.generateCount == 1 }
+        let httpID = UUID()
+        let queued = Task { try await arbiter.acquire(.http(httpID), timeout: nil) }
+        try await waitUntil { await arbiter.activity.queuedHTTPCount == 1 }
+
+        client.emitToken("first")
+        await #expect(throws: AppInferenceArbiterError.transportLost) {
+            _ = try await chatEvents.value
+        }
+        let ticket = try await queued.value
+        #expect(ticket.owner == .http(httpID))
+        #expect(await arbiter.loadedSession == nil)
+        #expect(client.disconnectCount == 1)
+        // The admission that granted the ticket already carried no session.
+        try await waitUntil { recorder.snapshot.contains { $0.activeOwner == .http(httpID) } }
+        #expect(recorder.snapshot.filter { $0.activeOwner == .http(httpID) }
+            .allSatisfy { $0.loadedSession == nil })
+        await arbiter.release(ticket)
+        #expect(client.generateCount == 1)
+        try await waitUntil { client.shutdownCount == 1 }
+        try await waitUntil { await arbiter.activity == .idle }
     }
 
     @Test func watchdogIsResetByEvents() async throws {
@@ -384,6 +471,7 @@ import Testing
         }
         client.finishCurrent()
         let events = try await chatEvents.value
+        #expect(client.disconnectCount == 0)
         #expect(client.shutdownCount == 0)
         #expect(events.filter { if case .token = $0 { true } else { false } }.count == 5)
     }

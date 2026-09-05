@@ -107,9 +107,10 @@ final class MockLifecycleInferenceClient: AppModelLifecycleClient, @unchecked Se
         return ensureLoadedCalls.count
     }
 
-    func waitForUnloadStart() async {
+    /// Returns once at least `expected` unloads have started.
+    func waitForUnloadStart(_ expected: Int = 1) async {
         for _ in 0..<200 {
-            if unloadHasStarted { return }
+            if unloadStartCount >= expected { return }
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
@@ -128,10 +129,10 @@ final class MockLifecycleInferenceClient: AppModelLifecycleClient, @unchecked Se
         }
     }
 
-    private var unloadHasStarted: Bool {
+    private var unloadStartCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        return unloadStartedCount > 0
+        return unloadStartedCount
     }
 
     private var loadStartCount: Int {

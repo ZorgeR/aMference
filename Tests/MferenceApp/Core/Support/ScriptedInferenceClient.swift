@@ -3,21 +3,32 @@ import Foundation
 
 /// A client whose streams the test drives by hand: nothing is emitted until
 /// the test says so, and every call that reaches the client is counted.
+/// After `disconnect()` it answers like `DecodeServiceInferenceClient` with
+/// its handles gone: `generate` fails with `.modelNotLoaded` without opening
+/// a stream, counted separately from the generations that reached the
+/// transport.
 final class ScriptedInferenceClient: AppInferenceClient,
     AppInferenceTransportControlling, @unchecked Sendable {
     private let lock = NSLock()
     private var live: [AsyncThrowingStream<AppInferenceEvent, Error>.Continuation] = []
     private var maxOverlap = 0
     private var _generateCount = 0
+    private var _refusedGenerateCount = 0
     private var _cancelCount = 0
+    private var _disconnectCount = 0
     private var _shutdownCount = 0
+    private var _disconnected = false
 
     /// When true, `cancel()` ends the live stream with a `.cancelled` event,
     /// the way the decode service answers a wire cancel.
     var cancelEmitsTerminal = true
 
+    /// Generations that opened a stream on the transport.
     var generateCount: Int { lock.withLock { _generateCount } }
+    /// Generations refused after `disconnect()`, never on the transport.
+    var refusedGenerateCount: Int { lock.withLock { _refusedGenerateCount } }
     var cancelCount: Int { lock.withLock { _cancelCount } }
+    var disconnectCount: Int { lock.withLock { _disconnectCount } }
     var shutdownCount: Int { lock.withLock { _shutdownCount } }
     var liveStreamCount: Int { lock.withLock { live.count } }
     /// The most streams ever open at once; the arbiter must keep this at 1.
@@ -26,10 +37,18 @@ final class ScriptedInferenceClient: AppInferenceClient,
     func generate(_ request: AppGenerationRequest)
         -> AsyncThrowingStream<AppInferenceEvent, Error> {
         AsyncThrowingStream { continuation in
-            lock.withLock {
+            let refused: Bool = lock.withLock {
+                if _disconnected {
+                    _refusedGenerateCount += 1
+                    return true
+                }
                 _generateCount += 1
                 live.append(continuation)
                 maxOverlap = max(maxOverlap, live.count)
+                return false
+            }
+            if refused {
+                continuation.finish(throwing: AppInferenceError.modelNotLoaded)
             }
         }
     }
@@ -43,6 +62,13 @@ final class ScriptedInferenceClient: AppInferenceClient,
         guard let continuation else { return }
         continuation.yield(.cancelled(Self.diagnostics(stopReason: .cancelled)))
         continuation.finish()
+    }
+
+    func disconnect() {
+        lock.withLock {
+            _disconnectCount += 1
+            _disconnected = true
+        }
     }
 
     func shutdown() {
